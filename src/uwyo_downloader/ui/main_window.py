@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QDateTimeEdit,
     QMenuBar,
     QMessageBox,
+    QLineEdit,
 )
 
 from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
@@ -44,6 +45,7 @@ class MainWindow(QMainWindow):
         self.station_thread: Optional[QThread] = None
         self.station_worker: Optional[StationListWorker] = None
         self.stations: List[StationInfo] = []
+        self.filtered_rows: List[int] = []
         self.icon_path = self._asset_path("assets/icons/icon-256.png")
         self.build_ui()
         self.apply_palette()
@@ -192,6 +194,14 @@ class MainWindow(QMainWindow):
 
         self.map_view = StationMapView()
         layout.addWidget(self.map_view)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Поиск:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Введите название или ID станции")
+        self.search_input.textChanged.connect(self.apply_filter)
+        filter_row.addWidget(self.search_input)
+        layout.addLayout(filter_row)
 
         self.station_table = QTableWidget()
         self.station_table.setColumnCount(5)
@@ -354,6 +364,7 @@ class MainWindow(QMainWindow):
         self.stations = stations
         self.station_status.setText(f"Найдено станций: {len(stations)}")
         self.station_table.setRowCount(len(stations))
+        self.filtered_rows = list(range(len(stations)))
         for row, station in enumerate(stations):
             self.station_table.setItem(row, 0, QTableWidgetItem(station.stationid))
             self.station_table.setItem(row, 1, QTableWidgetItem(station.name))
@@ -364,6 +375,7 @@ class MainWindow(QMainWindow):
             self.station_table.setItem(
                 row, 4, QTableWidgetItem(f"{station.lon:.2f}" if station.lon else "")
             )
+        self.apply_filter()
         self.map_view.set_stations(stations)
         self.download_selected_btn.setEnabled(True)
         self.station_worker = None
@@ -406,6 +418,24 @@ class MainWindow(QMainWindow):
         )
         self.start_download()
 
+    def apply_filter(self) -> None:
+        """
+        Простая фильтрация строк станции по подстроке в ID/названии.
+        """
+        if not hasattr(self, "station_table"):
+            return
+        query = self.search_input.text().strip().lower() if hasattr(self, "search_input") else ""
+        row_count = self.station_table.rowCount()
+        visible_rows: List[int] = []
+        for row in range(row_count):
+            id_item = self.station_table.item(row, 0)
+            name_item = self.station_table.item(row, 1)
+            hay = ((id_item.text() if id_item else "") + " " + (name_item.text() if name_item else "")).lower()
+            visible = query in hay
+            self.station_table.setRowHidden(row, not visible)
+            if visible:
+                visible_rows.append(row)
+        self.filtered_rows = visible_rows
     def _cleanup_download_thread(self) -> None:
         if self.download_thread is not None:
             self.download_thread.wait(50)
