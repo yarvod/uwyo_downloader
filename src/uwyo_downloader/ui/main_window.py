@@ -360,7 +360,7 @@ class MainWindow(QMainWindow):
         self.station_thread = thread
         thread.start()
 
-    def on_stations_loaded(self, stations: List[StationInfo]) -> None:
+    def on_stations_loaded(self, stations: List[StationInfo], map_html: str) -> None:
         self.stations = stations
         self.station_status.setText(f"Найдено станций: {len(stations)}")
         self.station_table.setRowCount(len(stations))
@@ -376,10 +376,16 @@ class MainWindow(QMainWindow):
                 row, 4, QTableWidgetItem(f"{station.lon:.2f}" if station.lon else "")
             )
         self.apply_filter()
-        self.map_view.set_stations(stations)
+        self.map_view.set_html(map_html)
         self.download_selected_btn.setEnabled(True)
         self.station_worker = None
         self.station_thread = None
+        try:
+            self.map_view.stationClicked.disconnect(self.on_map_station_clicked)
+        except TypeError:
+            pass
+        self.map_view.stationClicked.connect(self.on_map_station_clicked)
+        self.map_view.stationClicked.connect(self.on_map_station_clicked)
 
     def on_stations_failed(self, message: str) -> None:
         self.station_status.setText(f"Ошибка: {message}")
@@ -418,6 +424,19 @@ class MainWindow(QMainWindow):
         )
         self.start_download()
 
+    def on_map_station_clicked(self, station_id: str) -> None:
+        """
+        Обработчик клика по маркеру на карте: выбираем станцию и подсвечиваем в таблице.
+        """
+        self.station_input.setText(station_id)
+        # найти строку в таблице
+        for row in range(self.station_table.rowCount()):
+            item = self.station_table.item(row, 0)
+            if item and item.text() == station_id:
+                self.station_table.selectRow(row)
+                self.station_table.scrollToItem(item)
+                break
+        self.append_log(f"Выбрана станция {station_id} с карты")
     def apply_filter(self) -> None:
         """
         Простая фильтрация строк станции по подстроке в ID/названии.

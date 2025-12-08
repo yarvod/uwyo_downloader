@@ -112,7 +112,7 @@ class DownloadWorker(QObject):
 
 
 class StationListWorker(QObject):
-    loaded = Signal(list)
+    loaded = Signal(list, str)
     failed = Signal(str)
     finished = Signal()
 
@@ -123,7 +123,11 @@ class StationListWorker(QObject):
     def run(self) -> None:
         try:
             stations = fetch_stations_for_datetime(self.dt)
-            self.loaded.emit(stations)
+            # build map HTML in the worker to разгрузить UI
+            from .map_view import StationMapView
+
+            html = StationMapView.build_html(stations)
+            self.loaded.emit(stations, html)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
         finally:
