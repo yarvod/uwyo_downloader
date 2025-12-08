@@ -1,4 +1,5 @@
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QDateTimeEdit,
+    QMenuBar,
+    QMessageBox,
 )
 
 from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
@@ -42,6 +45,7 @@ class MainWindow(QMainWindow):
         self.stations: List[StationInfo] = []
         self.build_ui()
         self.apply_palette()
+        self.build_menu()
 
     def build_ui(self) -> None:
         main_widget = QWidget()
@@ -60,26 +64,43 @@ class MainWindow(QMainWindow):
         """
         Приводим QDateTime к datetime, поддерживаем старые биндинги без toPython().
         """
-        if hasattr(qdatetime, "toPython"):
-            return qdatetime.toPython()
-        # fallback: секундах с эпохи, интерпретируем как локальное время
-        return datetime.fromtimestamp(qdatetime.toSecsSinceEpoch())
+        ts = qdatetime.toSecsSinceEpoch()
+        return datetime.utcfromtimestamp(ts)
 
     @classmethod
     def _to_hour_datetime(cls, qdatetime):
         """
-        Приводим к целому часу (минуты/секунды/мкс = 0),
-        чтобы запросы всегда шли на "ровный" час.
+        Приводим к ближайшему синоптическому часу (00 или 12 UTC).
         """
         dt = cls._to_datetime(qdatetime)
-        return dt.replace(minute=0, second=0, microsecond=0)
+        return cls._nearest_synoptic_utc(dt)
 
     @staticmethod
-    def _current_hour_qdatetime() -> QDateTime:
-        dt = QDateTime.currentDateTime()
-        dt.setTime(dt.time().addSecs(-dt.time().second()))
-        dt.setTime(dt.time().addSecs(-dt.time().minute() * 60))
-        return dt
+    def _nearest_synoptic_utc(dt: datetime) -> datetime:
+        """
+        Возвращает dt (UTC) на ближайший 00 или 12 час.
+        """
+        total_hours = dt.hour + dt.minute / 60 + dt.second / 3600
+        nearest_slot = round(total_hours / 12) * 12
+        day_shift = 0
+        if nearest_slot >= 24:
+            nearest_slot -= 24
+            day_shift = 1
+        elif nearest_slot < 0:
+            nearest_slot += 24
+            day_shift = -1
+        snapped = dt.replace(
+            hour=int(nearest_slot), minute=0, second=0, microsecond=0
+        )
+        if day_shift:
+            snapped = snapped + timedelta(days=day_shift)
+        return snapped
+
+    @classmethod
+    def _current_synoptic_qdatetime(cls) -> QDateTime:
+        now_utc = datetime.utcnow()
+        snapped = cls._nearest_synoptic_utc(now_utc)
+        return QDateTime.fromSecsSinceEpoch(int(snapped.timestamp()), Qt.UTC)
 
     def build_download_panel(self) -> QWidget:
         box = QGroupBox("Скачать диапазон дат")
@@ -93,11 +114,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(station_row)
 
         dates_row = QHBoxLayout()
-        start_dt_default = self._current_hour_qdatetime().addDays(-1)
+        start_dt_default = self._current_synoptic_qdatetime().addDays(-1)
         self.start_dt = QDateTimeEdit(start_dt_default)
         self.start_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.start_dt.setCalendarPopup(True)
-        end_dt_default = self._current_hour_qdatetime()
+        end_dt_default = self._current_synoptic_qdatetime()
         self.end_dt = QDateTimeEdit(end_dt_default)
         self.end_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.end_dt.setCalendarPopup(True)
@@ -155,7 +176,7 @@ class MainWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Дата/время:"))
-        stations_dt_default = self._current_hour_qdatetime()
+        stations_dt_default = self._current_synoptic_qdatetime()
         self.stations_dt = QDateTimeEdit(stations_dt_default)
         self.stations_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.stations_dt.setCalendarPopup(True)
@@ -186,12 +207,19 @@ class MainWindow(QMainWindow):
         self.station_status = QLabel("")
         bottom_row.addWidget(self.station_status)
         layout.addLayout(bottom_row)
-        version_row = QHBoxLayout()
-        version_row.addStretch()
-        self.version_label = QLabel(f"Версия: {APP_VERSION}")
-        version_row.addWidget(self.version_label)
-        layout.addLayout(version_row)
         return box
+
+    def build_menu(self) -> None:
+        menu_bar: QMenuBar = self.menuBar()
+        about_action = menu_bar.addAction("О приложении")
+        about_action.triggered.connect(self.show_about)
+
+    def show_about(self) -> None:
+        QMessageBox.information(
+            self,
+            "О приложении",
+            f"UWYO Soundings Downloader\nВерсия: {APP_VERSION}\nАвтор: yarvod",
+        )
 
     def apply_palette(self) -> None:
         palette = self.palette()
@@ -265,6 +293,7 @@ class MainWindow(QMainWindow):
         worker.log.connect(self.append_log)
         worker.finished.connect(lambda *_: thread.quit())
         worker.finished.connect(lambda *_: worker.deleteLater())
+        thread.finished.connect(self._cleanup_download_thread)
         thread.finished.connect(thread.deleteLater)
 
         self.download_worker = worker
@@ -287,8 +316,7 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.download_selected_btn.setEnabled(True)
-        self.download_worker = None
-        self.download_thread = None
+        # download_worker/thread cleanup happens in _cleanup_download_thread
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -373,6 +401,15 @@ class MainWindow(QMainWindow):
             f"Скачиваем {station.stationid} за {self.stations_dt.dateTime().toString('yyyy-MM-dd HH:mm')}"
         )
         self.start_download()
+
+    def _cleanup_download_thread(self) -> None:
+        if self.download_thread is not None:
+            self.download_thread.wait(50)
+        self.download_thread = None
+        self.download_worker = None
+        self.download_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.download_selected_btn.setEnabled(True)
 
 
 def main() -> None:
