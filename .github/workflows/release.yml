@@ -31,6 +31,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
+      - name: Generate icons
+        run: python scripts/generate_icons.py
+
       - name: Embed version into package
         run: |
           python - <<'PY'
@@ -44,7 +47,16 @@ jobs:
           PY
 
       - name: Build application
-        run: pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src main.py
+        shell: bash
+        run: |
+          ICON_ARG="--icon assets/icons/app.ico"
+          ADD_DATA="assets/icons/icon-256.png:assets/icons"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            ICON_ARG="--icon assets/icons/app.icns"
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            ADD_DATA="assets/icons/icon-256.png;assets/icons"
+          fi
+          pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src $ICON_ARG --add-data "$ADD_DATA" main.py
 
       - name: Archive (macOS)
         if: runner.os == 'macOS'

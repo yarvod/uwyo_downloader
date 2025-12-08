@@ -1,10 +1,11 @@
 import sys
 from datetime import datetime, timedelta
+import sys
 from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import QDateTime, QThread, Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QPalette, QIcon
 from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
@@ -43,9 +44,12 @@ class MainWindow(QMainWindow):
         self.station_thread: Optional[QThread] = None
         self.station_worker: Optional[StationListWorker] = None
         self.stations: List[StationInfo] = []
+        self.icon_path = self._asset_path("assets/icons/icon-256.png")
         self.build_ui()
         self.apply_palette()
         self.build_menu()
+        if self.icon_path:
+            self.setWindowIcon(QIcon(self.icon_path))
 
     def build_ui(self) -> None:
         main_widget = QWidget()
@@ -410,6 +414,24 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.download_selected_btn.setEnabled(True)
+
+    @staticmethod
+    def _asset_path(rel: str) -> Optional[str]:
+        """
+        Resolve asset path for both dev and PyInstaller bundle.
+        """
+        base_paths = []
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            base_paths.append(Path(sys._MEIPASS))  # type: ignore[attr-defined]
+        try:
+            base_paths.append(Path(__file__).resolve().parents[3])  # project root
+        except IndexError:
+            pass
+        for base in base_paths:
+            candidate = base / rel
+            if candidate.exists():
+                return str(candidate)
+        return None
 
 
 def main() -> None:

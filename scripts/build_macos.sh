@@ -28,7 +28,7 @@ version_file.write_text(f'__version__ = "{version}"\n', encoding="utf-8")
 print(f"Wrote version {version} to {version_file}")
 PY
 
-pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src main.py
+pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src --icon assets/icons/app.icns --add-data "assets/icons/icon-256.png:assets/icons" main.py
 
 cd dist
 mv "profile-downloader-${APP_VERSION}" "profile-downloader-${APP_VERSION}-macos"
