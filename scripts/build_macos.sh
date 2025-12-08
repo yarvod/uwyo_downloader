@@ -18,6 +18,8 @@ fi
 
 echo "Using version: $APP_VERSION"
 
+python scripts/generate_icons.py
+
 python - <<'PY'
 from pathlib import Path
 import os

@@ -1,73 +1,56 @@
 from typing import List
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen
-from PySide6.QtWidgets import QGraphicsEllipseItem, QGraphicsScene, QGraphicsView
+import folium
+from PySide6.QtCore import QUrl
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from ..models import StationInfo
 
 
-class StationMapView(QGraphicsView):
+class StationMapView(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setScene(QGraphicsScene(self))
-        self.setRenderHints(
-            self.renderHints()
-            | QPainter.Antialiasing
-            | QPainter.TextAntialiasing
-        )
-        self._stations: List[StationInfo] = []
+        self.webview = QWebEngineView()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.webview)
         self.setMinimumHeight(320)
-        self.setStyleSheet(
-            "QGraphicsView { border: 1px solid #1f2937; background: transparent; }"
-        )
-        self.draw_scene()
 
-    def resizeEvent(self, event):  # noqa: N802
-        super().resizeEvent(event)
-        self.draw_scene()
+        settings = self.webview.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, True)
+
+        self.set_stations([])
+
+    @staticmethod
+    def _center_for(stations: List[StationInfo]) -> list[float]:
+        coords = [(s.lat, s.lon) for s in stations if s.lat is not None and s.lon is not None]
+        if not coords:
+            return [0.0, 0.0]
+        avg_lat = sum(lat for lat, _ in coords) / len(coords)
+        avg_lon = sum(lon for _, lon in coords) / len(coords)
+        return [avg_lat, avg_lon]
 
     def set_stations(self, stations: List[StationInfo]) -> None:
-        self._stations = [s for s in stations if s.has_coords]
-        self.draw_scene()
+        """
+        Рендерим новую HTML-карту с маркерами станций.
+        """
+        center = self._center_for(stations)
+        fmap = folium.Map(location=center, zoom_start=3, tiles="OpenStreetMap", control_scale=True)
 
-    def draw_scene(self) -> None:
-        scene = self.scene()
-        scene.clear()
-        rect = self.viewport().rect()
-        width = max(rect.width() - 2, 200)
-        height = max(rect.height() - 2, 200)
-        scene.setSceneRect(0, 0, width, height)
+        for station in stations:
+            if station.lat is None or station.lon is None:
+                continue
+            tooltip = f"{station.stationid} — {station.name}"
+            folium.Marker(
+                [station.lat, station.lon],
+                tooltip=tooltip,
+            ).add_to(fmap)
 
-        bg = QLinearGradient(0, 0, width, height)
-        bg.setColorAt(0.0, QColor("#0f172a"))
-        bg.setColorAt(1.0, QColor("#111827"))
-        scene.addRect(0, 0, width, height, pen=Qt.NoPen, brush=bg)
-
-        grid_pen = QPen(QColor("#1f2937"))
-        grid_pen.setWidth(1)
-        for lon in range(-180, 181, 60):
-            x = self.lon_to_x(lon, width)
-            scene.addLine(x, 0, x, height, pen=grid_pen)
-        for lat in range(-90, 91, 30):
-            y = self.lat_to_y(lat, height)
-            scene.addLine(0, y, width, y, pen=grid_pen)
-
-        point_pen = QPen(QColor("#22d3ee"))
-        point_pen.setWidth(1)
-        for station in self._stations:
-            x = self.lon_to_x(station.lon or 0.0, width)
-            y = self.lat_to_y(station.lat or 0.0, height)
-            item = QGraphicsEllipseItem(x - 3, y - 3, 6, 6)
-            item.setBrush(QColor("#22d3ee"))
-            item.setPen(point_pen)
-            item.setToolTip(f"{station.stationid}\n{station.name}")
-            scene.addItem(item)
-
-    @staticmethod
-    def lon_to_x(lon: float, width: float) -> float:
-        return (lon + 180.0) / 360.0 * width
-
-    @staticmethod
-    def lat_to_y(lat: float, height: float) -> float:
-        return (90.0 - lat) / 180.0 * height
+        html = fmap.get_root().render()
+        # baseUrl https to allow external assets
+        self.webview.setHtml(html, baseUrl=QUrl("https://local.map/"))

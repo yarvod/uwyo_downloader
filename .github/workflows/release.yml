@@ -50,13 +50,13 @@ jobs:
         shell: bash
         run: |
           ICON_ARG="--icon assets/icons/app.ico"
-          ADD_DATA="assets/icons/icon-256.png:assets/icons"
+          ADD_DATA=("assets/icons/icon-256.png:assets/icons")
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             ICON_ARG="--icon assets/icons/app.icns"
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            ADD_DATA="assets/icons/icon-256.png;assets/icons"
+            ADD_DATA=("assets/icons/icon-256.png;assets/icons")
           fi
-          pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src $ICON_ARG --add-data "$ADD_DATA" main.py
+          pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src $ICON_ARG "${ADD_DATA[@]/#/--add-data=}" main.py
 
       - name: Archive (macOS)
         if: runner.os == 'macOS'
