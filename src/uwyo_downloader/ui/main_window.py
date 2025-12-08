@@ -1,4 +1,3 @@
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -24,7 +23,7 @@ from PySide6.QtWidgets import (
     QDateTimeEdit,
 )
 
-from ..config import DEFAULT_OUTPUT_DIR
+from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
 from ..models import StationInfo
 from ..utils import build_datetimes
 from .map_view import StationMapView
@@ -34,7 +33,7 @@ from .workers import DownloadWorker, StationListWorker
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("UWYO Soundings Downloader")
+        self.setWindowTitle(f"UWYO Soundings Downloader v{APP_VERSION}")
         self.output_dir = DEFAULT_OUTPUT_DIR
         self.download_thread: Optional[QThread] = None
         self.download_worker: Optional[DownloadWorker] = None
@@ -158,6 +157,11 @@ class MainWindow(QMainWindow):
         self.station_status = QLabel("")
         bottom_row.addWidget(self.station_status)
         layout.addLayout(bottom_row)
+        version_row = QHBoxLayout()
+        version_row.addStretch()
+        self.version_label = QLabel(f"Версия: {APP_VERSION}")
+        version_row.addWidget(self.version_label)
+        layout.addLayout(version_row)
         return box
 
     def apply_palette(self) -> None:

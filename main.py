@@ -4,7 +4,7 @@ import sys
 
 def main() -> None:
     """
-    Тонкий вход: пробрасываем путь src и запускаем GUI.
+    Thin entrypoint: add ./src to sys.path and run packaged app.
     """
     root = Path(__file__).resolve().parent
     src_path = root / "src"

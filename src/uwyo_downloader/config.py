@@ -1,8 +1,12 @@
+import os
 from pathlib import Path
+
+from .version import __version__
 
 BASE_URL = "https://weather.uwyo.edu/wsgi/sounding"
 STATIONS_URL = "https://weather.uwyo.edu/wsgi/sounding_json"
-USER_AGENT = "uwyo-sounding-gui/1.1"
+APP_VERSION = os.environ.get("APP_VERSION", __version__)
+USER_AGENT = f"uwyo-sounding-gui/{APP_VERSION}"
 DEFAULT_OUTPUT_DIR = Path("profiles")
 DEFAULT_CONCURRENCY = 4
 REQUEST_TIMEOUT = 30.0
