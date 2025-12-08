@@ -1,0 +1,55 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build application
+        run: pyinstaller --noconfirm --windowed --name profile-downloader --paths src src/uwyo_downloader/__main__.py
+
+      - name: Archive (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && zip -r ../profile-downloader-macos.zip profile-downloader
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        run: powershell -Command "Compress-Archive -Path dist\\profile-downloader -DestinationPath profile-downloader-windows.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-downloader-${{ runner.os }}
+          path: profile-downloader-*.zip
+
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: profile-downloader-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
