@@ -55,6 +55,32 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_widget)
         self.resize(1200, 720)
 
+    @staticmethod
+    def _to_datetime(qdatetime):
+        """
+        Приводим QDateTime к datetime, поддерживаем старые биндинги без toPython().
+        """
+        if hasattr(qdatetime, "toPython"):
+            return qdatetime.toPython()
+        # fallback: секундах с эпохи, интерпретируем как локальное время
+        return datetime.fromtimestamp(qdatetime.toSecsSinceEpoch())
+
+    @classmethod
+    def _to_hour_datetime(cls, qdatetime):
+        """
+        Приводим к целому часу (минуты/секунды/мкс = 0),
+        чтобы запросы всегда шли на "ровный" час.
+        """
+        dt = cls._to_datetime(qdatetime)
+        return dt.replace(minute=0, second=0, microsecond=0)
+
+    @staticmethod
+    def _current_hour_qdatetime() -> QDateTime:
+        dt = QDateTime.currentDateTime()
+        dt.setTime(dt.time().addSecs(-dt.time().second()))
+        dt.setTime(dt.time().addSecs(-dt.time().minute() * 60))
+        return dt
+
     def build_download_panel(self) -> QWidget:
         box = QGroupBox("Скачать диапазон дат")
         layout = QVBoxLayout(box)
@@ -67,10 +93,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(station_row)
 
         dates_row = QHBoxLayout()
-        self.start_dt = QDateTimeEdit(QDateTime.currentDateTime().addDays(-1))
+        start_dt_default = self._current_hour_qdatetime().addDays(-1)
+        self.start_dt = QDateTimeEdit(start_dt_default)
         self.start_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.start_dt.setCalendarPopup(True)
-        self.end_dt = QDateTimeEdit(QDateTime.currentDateTime())
+        end_dt_default = self._current_hour_qdatetime()
+        self.end_dt = QDateTimeEdit(end_dt_default)
         self.end_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.end_dt.setCalendarPopup(True)
         dates_row.addWidget(QLabel("Начало:"))
@@ -127,7 +155,8 @@ class MainWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Дата/время:"))
-        self.stations_dt = QDateTimeEdit(QDateTime.currentDateTime())
+        stations_dt_default = self._current_hour_qdatetime()
+        self.stations_dt = QDateTimeEdit(stations_dt_default)
         self.stations_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.stations_dt.setCalendarPopup(True)
         top_row.addWidget(self.stations_dt)
@@ -212,8 +241,8 @@ class MainWindow(QMainWindow):
             return
         try:
             datetimes = build_datetimes(
-                self.start_dt.dateTime().toPyDateTime(),
-                self.end_dt.dateTime().toPyDateTime(),
+                self._to_hour_datetime(self.start_dt.dateTime()),
+                self._to_hour_datetime(self.end_dt.dateTime()),
                 self.step_input.value(),
             )
         except Exception as exc:  # noqa: BLE001
@@ -225,6 +254,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Загрузка...")
         self.download_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self.download_selected_btn.setEnabled(False)
 
         worker = DownloadWorker(station_id, datetimes, Path(self.folder_input.text()))
         thread = QThread()
@@ -256,6 +286,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(message)
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self.download_selected_btn.setEnabled(True)
         self.download_worker = None
         self.download_thread = None
 
@@ -267,10 +298,11 @@ class MainWindow(QMainWindow):
     def load_stations(self) -> None:
         if self.station_worker is not None:
             return
-        dt = self.stations_dt.dateTime().toPyDateTime()
+        dt = self._to_hour_datetime(self.stations_dt.dateTime())
         self.station_status.setText("Загрузка списка...")
         self.map_view.set_stations([])
         self.station_table.setRowCount(0)
+        self.download_selected_btn.setEnabled(False)
 
         worker = StationListWorker(dt)
         thread = QThread()
@@ -301,12 +333,14 @@ class MainWindow(QMainWindow):
                 row, 4, QTableWidgetItem(f"{station.lon:.2f}" if station.lon else "")
             )
         self.map_view.set_stations(stations)
+        self.download_selected_btn.setEnabled(True)
         self.station_worker = None
         self.station_thread = None
 
     def on_stations_failed(self, message: str) -> None:
         self.station_status.setText(f"Ошибка: {message}")
         self.append_log(f"Ошибка загрузки списка станций: {message}")
+        self.download_selected_btn.setEnabled(True)
         self.station_worker = None
         self.station_thread = None
 
@@ -318,6 +352,13 @@ class MainWindow(QMainWindow):
         self.station_input.setText(station_id)
 
     def download_selected_station(self) -> None:
+        if self.station_worker is not None:
+            self.append_log("Дождитесь загрузки списка станций.")
+            return
+        if self.download_worker is not None:
+            self.append_log("Уже идет загрузка — дождитесь завершения.")
+            return
+
         selection = self.station_table.selectionModel().selectedRows()
         if not selection:
             self.append_log("Выберите станцию из списка.")

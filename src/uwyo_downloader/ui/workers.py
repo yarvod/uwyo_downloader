@@ -34,12 +34,17 @@ class DownloadWorker(QObject):
         self._cancel_flag.set()
 
     def run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            asyncio.run(self._run())
+            loop.run_until_complete(self._run())
         except asyncio.CancelledError:
             self.finished.emit(False, "Отменено")
         except Exception as exc:  # noqa: BLE001
             self.finished.emit(False, str(exc))
+        finally:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
 
     async def _run(self) -> None:
         if not self.datetimes:
