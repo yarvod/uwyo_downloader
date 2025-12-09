@@ -1,6 +1,5 @@
 import sys
 from datetime import datetime, timedelta
-import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,10 +27,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 
-from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
+from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR, USE_MAP_SUBPROCESS
 from ..models import StationInfo
 from ..utils import build_datetimes
-from .map_view import StationMapView
+from .map_view import StationMapProcessHost, StationMapView
 from .workers import DownloadWorker, StationListWorker
 
 
@@ -45,6 +44,7 @@ class MainWindow(QMainWindow):
         self.station_thread: Optional[QThread] = None
         self.station_worker: Optional[StationListWorker] = None
         self.stations: List[StationInfo] = []
+        self.station_row_index: dict[str, int] = {}
         self.filtered_rows: List[int] = []
         self.icon_path = self._asset_path("assets/icons/icon-256.png")
         self.build_ui()
@@ -76,15 +76,15 @@ class MainWindow(QMainWindow):
     @classmethod
     def _to_hour_datetime(cls, qdatetime):
         """
-        Приводим к ближайшему синоптическому часу (00 или 12 UTC).
+        Приводим к предыдущему синоптическому часу (00 или 12 UTC, без будущего).
         """
         dt = cls._to_datetime(qdatetime)
-        return cls._nearest_synoptic_utc(dt)
+        return cls._previous_synoptic_utc(dt)
 
     @staticmethod
     def _nearest_synoptic_utc(dt: datetime) -> datetime:
         """
-        Возвращает dt (UTC) на ближайший 00 или 12 час.
+        Возвращает dt (UTC) на ближайший 00 или 12 час (округление).
         """
         total_hours = dt.hour + dt.minute / 60 + dt.second / 3600
         nearest_slot = round(total_hours / 12) * 12
@@ -102,10 +102,19 @@ class MainWindow(QMainWindow):
             snapped = snapped + timedelta(days=day_shift)
         return snapped
 
+    @staticmethod
+    def _previous_synoptic_utc(dt: datetime) -> datetime:
+        """
+        Возвращает предыдущее синоптическое время (00 или 12 UTC),
+        без перехода в будущее. Если сейчас 11 UTC -> 00, если 13 UTC -> 12.
+        """
+        hour_slot = 12 if dt.hour >= 12 else 0
+        return dt.replace(hour=hour_slot, minute=0, second=0, microsecond=0)
+
     @classmethod
     def _current_synoptic_qdatetime(cls) -> QDateTime:
         now_utc = datetime.utcnow()
-        snapped = cls._nearest_synoptic_utc(now_utc)
+        snapped = cls._previous_synoptic_utc(now_utc)
         return QDateTime.fromSecsSinceEpoch(int(snapped.timestamp()), Qt.UTC)
 
     def build_download_panel(self) -> QWidget:
@@ -192,7 +201,12 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.load_stations_btn)
         layout.addLayout(top_row)
 
-        self.map_view = StationMapView()
+        self.map_view = (
+            StationMapProcessHost() if USE_MAP_SUBPROCESS else StationMapView()
+        )
+        if isinstance(self.map_view, StationMapProcessHost):
+            self.map_view.setMinimumHeight(120)
+        self.map_view.stationClicked.connect(self.on_map_station_clicked)
         layout.addWidget(self.map_view)
 
         filter_row = QHBoxLayout()
@@ -213,6 +227,9 @@ class MainWindow(QMainWindow):
         self.station_table.horizontalHeader().setStretchLastSection(True)
         self.station_table.itemSelectionChanged.connect(self.fill_station_from_selection)
         layout.addWidget(self.station_table)
+        # делаем таблицу выше, карта в отдельном процессе занимает мало места
+        layout.setStretch(1, 1)  # карта/контейнер
+        layout.setStretch(3, 5)  # таблица
 
         bottom_row = QHBoxLayout()
         self.download_selected_btn = QPushButton("Скачать выбранную")
@@ -345,6 +362,11 @@ class MainWindow(QMainWindow):
         self.map_view.set_stations([])
         self.station_table.setRowCount(0)
         self.download_selected_btn.setEnabled(False)
+        self.load_stations_btn.setEnabled(False)
+        self.map_view.setEnabled(False)
+        self.station_table.setEnabled(False)
+        if hasattr(self, "search_input"):
+            self.search_input.setEnabled(False)
 
         worker = StationListWorker(dt)
         thread = QThread()
@@ -362,6 +384,7 @@ class MainWindow(QMainWindow):
 
     def on_stations_loaded(self, stations: List[StationInfo], map_html: str) -> None:
         self.stations = stations
+        self.station_row_index = {s.stationid: idx for idx, s in enumerate(stations)}
         self.station_status.setText(f"Найдено станций: {len(stations)}")
         self.station_table.setRowCount(len(stations))
         self.filtered_rows = list(range(len(stations)))
@@ -380,12 +403,11 @@ class MainWindow(QMainWindow):
         self.download_selected_btn.setEnabled(True)
         self.station_worker = None
         self.station_thread = None
-        try:
-            self.map_view.stationClicked.disconnect(self.on_map_station_clicked)
-        except TypeError:
-            pass
-        self.map_view.stationClicked.connect(self.on_map_station_clicked)
-        self.map_view.stationClicked.connect(self.on_map_station_clicked)
+        self.load_stations_btn.setEnabled(True)
+        self.map_view.setEnabled(True)
+        self.station_table.setEnabled(True)
+        if hasattr(self, "search_input"):
+            self.search_input.setEnabled(True)
 
     def on_stations_failed(self, message: str) -> None:
         self.station_status.setText(f"Ошибка: {message}")
@@ -393,6 +415,11 @@ class MainWindow(QMainWindow):
         self.download_selected_btn.setEnabled(True)
         self.station_worker = None
         self.station_thread = None
+        self.load_stations_btn.setEnabled(True)
+        self.map_view.setEnabled(True)
+        self.station_table.setEnabled(True)
+        if hasattr(self, "search_input"):
+            self.search_input.setEnabled(True)
 
     def fill_station_from_selection(self) -> None:
         items = self.station_table.selectedItems()
@@ -429,13 +456,20 @@ class MainWindow(QMainWindow):
         Обработчик клика по маркеру на карте: выбираем станцию и подсвечиваем в таблице.
         """
         self.station_input.setText(station_id)
-        # найти строку в таблице
-        for row in range(self.station_table.rowCount()):
-            item = self.station_table.item(row, 0)
-            if item and item.text() == station_id:
-                self.station_table.selectRow(row)
+        target_row = self.station_row_index.get(station_id)
+        if target_row is None:
+            for row in range(self.station_table.rowCount()):
+                item = self.station_table.item(row, 0)
+                if item and item.text() == station_id:
+                    target_row = row
+                    break
+        if target_row is not None:
+            item = self.station_table.item(target_row, 0)
+            if item:
+                self.station_table.selectRow(target_row)
                 self.station_table.scrollToItem(item)
-                break
+        # Продублируем установку ID, чтобы точно попасть в поле даже если сигнал пришел позже.
+        self.station_input.setText(station_id)
         self.append_log(f"Выбрана станция {station_id} с карты")
     def apply_filter(self) -> None:
         """
