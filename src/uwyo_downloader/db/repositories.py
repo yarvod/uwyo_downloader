@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import Session
 
@@ -130,22 +130,49 @@ class SoundingRepository:
         )
         return int(existing) if existing is not None else 0
 
+    def _filters(
+        self,
+        station_ids: Optional[list[str]] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> list:
+        conditions = []
+        if station_ids:
+            conditions.append(Sounding.station_id.in_(station_ids))
+        if start:
+            conditions.append(Sounding.captured_at >= _ensure_dt(start))
+        if end:
+            conditions.append(Sounding.captured_at <= _ensure_dt(end))
+        return conditions
+
     def list(
         self,
         station_ids: Optional[list[str]] = None,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
         limit: int = 200,
+        offset: int = 0,
     ) -> List[SoundingRecord]:
-        stmt = select(Sounding).order_by(Sounding.captured_at.desc()).limit(limit)
-        if station_ids:
-            stmt = stmt.where(Sounding.station_id.in_(station_ids))
-        if start:
-            stmt = stmt.where(Sounding.captured_at >= _ensure_dt(start))
-        if end:
-            stmt = stmt.where(Sounding.captured_at <= _ensure_dt(end))
+        stmt = (
+            select(Sounding)
+            .where(*self._filters(station_ids, start, end))
+            .order_by(Sounding.captured_at.desc())
+            .offset(max(0, offset))
+            .limit(limit)
+        )
         rows = self.session.scalars(stmt).all()
         return [self._to_record(row) for row in rows]
+
+    def count(
+        self,
+        station_ids: Optional[list[str]] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(Sounding).where(
+            *self._filters(station_ids, start, end)
+        )
+        return int(self.session.scalar(stmt) or 0)
 
     def get_by_id(self, record_id: int) -> Optional[SoundingRecord]:
         row = self.session.get(Sounding, record_id)

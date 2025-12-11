@@ -56,6 +56,10 @@ class MainWindow(QMainWindow):
         self.stations: List[StationInfo] = []
         self.sounding_records: List[SoundingRecord] = []
         self.icon_path = self._asset_path("assets/icons/icon-256.png")
+        self.page_size = 100
+        self.current_page = 1
+        self.total_records = 0
+        self.total_pages = 1
 
         self.build_ui()
         self.apply_palette()
@@ -289,15 +293,27 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(QLabel("Станция:"))
         self.sounding_station_search = QLineEdit()
         self.sounding_station_search.setPlaceholderText("Поиск по ID или названию (БД)")
+        self.sounding_station_search.returnPressed.connect(
+            lambda: self.load_soundings(reset_page=True)
+        )
         filter_row.addWidget(self.sounding_station_search)
         filter_row.addStretch()
-        self.apply_filters_btn = QPushButton("Применить")
-        self.apply_filters_btn.clicked.connect(self.load_soundings)
-        self.reset_filters_btn = QPushButton("Сброс")
-        self.reset_filters_btn.clicked.connect(self.reset_sounding_filters)
+        self.apply_filters_btn = QPushButton("Найти")
+        self.apply_filters_btn.clicked.connect(lambda: self.load_soundings(reset_page=True))
         filter_row.addWidget(self.apply_filters_btn)
-        filter_row.addWidget(self.reset_filters_btn)
         layout.addLayout(filter_row)
+
+        pagination_row = QHBoxLayout()
+        self.prev_page_btn = QPushButton("← Назад")
+        self.prev_page_btn.clicked.connect(lambda: self.change_page(-1))
+        self.next_page_btn = QPushButton("Вперед →")
+        self.next_page_btn.clicked.connect(lambda: self.change_page(1))
+        self.pagination_label = QLabel("Страница 1/1 (0)")
+        pagination_row.addWidget(self.prev_page_btn)
+        pagination_row.addWidget(self.next_page_btn)
+        pagination_row.addWidget(self.pagination_label)
+        pagination_row.addStretch()
+        layout.addLayout(pagination_row)
 
         splitter = QSplitter(Qt.Vertical)
 
@@ -476,7 +492,7 @@ class MainWindow(QMainWindow):
         try:
             saved = DownloadWorker._retry_on_lock(_write, retries=5, delay=0.15)
             self.append_log(f"В БД записано профилей: {saved}")
-            self.load_soundings()
+            self.load_soundings(reset_page=True)
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"Ошибка сохранения в БД: {exc}")
 
@@ -663,37 +679,62 @@ class MainWindow(QMainWindow):
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
-    def load_soundings(self) -> None:
+    def load_soundings(self, reset_page: bool = False) -> None:
         if self.sounding_loading:
             return
+        if reset_page:
+            self.current_page = 1
         self.sounding_loading = True
         try:
             station_query = self.sounding_station_search.text().strip() or None
 
-            def _read_soundings() -> List[SoundingRecord]:
+            def _read_soundings() -> tuple[list[SoundingRecord], int]:
                 with self.container.session() as session:
                     station_ids: Optional[list[str]] = None
                     if station_query:
+                        parsed_id = station_query.split("—")[0].strip()
                         station_repo = self.container.station_repo(session)
-                        matches = station_repo.search(station_query, limit=50)
-                        station_ids = [m.stationid for m in matches] or None
-                        if station_ids is None:
-                            return []
+                        if parsed_id and not station_repo.get_by_id(parsed_id):
+                            self.current_page = 1
+                            self.total_pages = 1
+                            self.total_records = 0
+                            return [], 0
+                        station_ids = [parsed_id] if parsed_id else None
                     repo = self.container.sounding_repo(session)
-                    return repo.list(
+                    total = repo.count(
                         station_ids=station_ids,
                         start=None,
                         end=None,
-                        limit=500,
                     )
+                    total_pages = max(1, (total + self.page_size - 1) // self.page_size)
+                    page = min(self.current_page, total_pages)
+                    offset = (page - 1) * self.page_size
+                    records = repo.list(
+                        station_ids=station_ids,
+                        start=None,
+                        end=None,
+                        limit=self.page_size,
+                        offset=offset,
+                    )
+                    self.current_page = page
+                    self.total_pages = total_pages
+                    self.total_records = total
+                    return records, total
 
-            records = DownloadWorker._retry_on_lock(_read_soundings, retries=5, delay=0.1)
+            records, _ = DownloadWorker._retry_on_lock(
+                _read_soundings, retries=5, delay=0.1
+            )
             self.sounding_records = records
             self.populate_sounding_table()
+            self._update_pagination()
         except Exception as exc:  # noqa: BLE001
             self.sounding_records = []
             self.populate_sounding_table()
             self.append_log(f"Ошибка чтения профилей: {exc}")
+            self.total_records = 0
+            self.total_pages = 1
+            self.current_page = 1
+            self._update_pagination()
         finally:
             self.sounding_loading = False
 
@@ -732,9 +773,24 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.sounding_records):
             self.display_payload(self.sounding_records[row])
 
+    def change_page(self, delta: int) -> None:
+        target = self.current_page + delta
+        if target < 1 or target > self.total_pages:
+            return
+        self.current_page = target
+        self.load_soundings()
+
+    def _update_pagination(self) -> None:
+        self.total_pages = max(1, self.total_pages)
+        self.pagination_label.setText(
+            f"Страница {self.current_page}/{self.total_pages} (всего {self.total_records})"
+        )
+        self.prev_page_btn.setEnabled(self.current_page > 1)
+        self.next_page_btn.setEnabled(self.current_page < self.total_pages)
+
     def reset_sounding_filters(self) -> None:
         self.sounding_station_search.clear()
-        self.load_soundings()
+        self.load_soundings(reset_page=True)
 
     def display_payload(self, record: SoundingRecord) -> None:
         payload = record.parsed_payload()
