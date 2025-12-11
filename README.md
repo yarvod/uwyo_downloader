@@ -30,8 +30,16 @@ python3 main.py
   from pathlib import Path; import os
   Path("src/uwyo_downloader/version.py").write_text(f'__version__ = "{os.environ["APP_VERSION"]}"\n')
   PY
-  pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src main.py
+  pyinstaller --noconfirm --windowed \
+    --name "profile-downloader-${APP_VERSION}" \
+    --paths src \
+    --icon assets/icons/app.icns \
+    --hidden-import logging.config \
+    --add-data "assets/icons/icon-256.png:assets/icons" \
+    --add-data "src/uwyo_downloader/db/alembic:uwyo_downloader/db/alembic" \
+    main.py
   ```
+  На Windows используйте `.ico` в `--icon` и `;` в `--add-data`.
 
 - CI: `.github/workflows/release.yml` собирает артефакты для macOS/Windows по тегу `v*` или вручную через `workflow_dispatch`, вшивает версию из `github.ref_name` и публикует релизные ZIP.
 

@@ -487,7 +487,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 self.append_log(f"Ошибка сохранения в БД: {exc}")
         self.append_log(message)
-        self.progress_label.setText(message)
+        self.progress_label.setText(message[:30])
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.download_thread = None
