@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Optional
+import csv
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -36,7 +37,27 @@ class SoundingRecord(BaseModel):
     model_config = ConfigDict(extra="ignore", from_attributes=True)
 
     def parsed_payload(self) -> dict:
-        try:
-            return json.loads(self.payload_json)
-        except Exception:  # noqa: BLE001
-            return {"raw": self.payload_json, "columns": [], "rows": []}
+        # CSV-текст с разделителем ";"
+        return parse_csv_payload(self.payload_json)
+
+
+def parse_csv_payload(text: str) -> dict:
+    reader = csv.reader(text.splitlines(), delimiter=";")
+    rows_iter = list(reader)
+    if not rows_iter:
+        return {"columns": [], "rows": [], "raw": text}
+    columns = rows_iter[0]
+    rows_data = []
+    for row in rows_iter[1:]:
+        row_dict = {}
+        for col, val in zip(columns, row):
+            if val == "":
+                row_dict[col] = ""
+                continue
+            try:
+                num = float(val)
+                row_dict[col] = num
+            except ValueError:
+                row_dict[col] = val
+        rows_data.append(row_dict)
+    return {"columns": columns, "rows": rows_data, "raw": text}

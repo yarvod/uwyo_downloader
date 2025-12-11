@@ -113,7 +113,7 @@ class DownloadThread(Thread):
                                     station_id=self.station_id,
                                     captured_at=dt,
                                     station_name=station_name,
-                                    payload_json=result.payload_json,
+                                    payload_json=result.payload_text,
                                     path=result.path,
                                 )
                             )

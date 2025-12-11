@@ -11,7 +11,7 @@ class SoundingPayload:
     station_id: str
     captured_at: datetime
     station_name: str
-    payload_json: str
+    payload_json: str  # stored as CSV text
     path: Optional[Path]
 
 

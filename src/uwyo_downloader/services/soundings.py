@@ -29,11 +29,11 @@ _COLUMN_UNITS = {
 
 
 class SoundingFetchResult:
-    def __init__(self, path: Path | None, content: str, station_name: str, payload_json: str) -> None:
+    def __init__(self, path: Path | None, content: str, station_name: str, payload_text: str) -> None:
         self.path = path
         self.content = content
         self.station_name = station_name
-        self.payload_json = payload_json
+        self.payload_text = payload_text
 
 
 def fetch_sounding(
@@ -68,13 +68,12 @@ def fetch_sounding(
 
     text_block = pre.get_text("\n", strip=False)
     payload_dict, csv_text = _parse_sounding(text_block)
-    payload_json = json.dumps(payload_dict, ensure_ascii=False)
     out_path: Path | None = None
     if save_to_disk:
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = make_filename(station_name, dt, output_dir, suffix=".csv")
         out_path.write_text(csv_text, encoding="utf-8")
-    return SoundingFetchResult(out_path, csv_text, station_name, payload_json)
+    return SoundingFetchResult(out_path, csv_text, station_name, csv_text)
 
 
 def build_http_client(concurrency: int) -> httpx.Client:
