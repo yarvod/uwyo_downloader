@@ -90,7 +90,15 @@ jobs:
       - name: Archive (Windows)
         if: runner.os == 'Windows'
         run: |
-          powershell -Command "Move-Item \"dist\\profile-downloader-${Env:APP_VERSION}\" \"dist\\profile-downloader-${Env:APP_VERSION}-windows\"; Compress-Archive -Path \"dist\\profile-downloader-${Env:APP_VERSION}-windows\" -DestinationPath \"profile-downloader-${Env:APP_VERSION}-windows.zip\""
+          pwsh -Command "
+            $orig = \"profile-downloader-${Env:APP_VERSION}\";
+            $safeVer = \"${Env:APP_VERSION}\" -replace '\\.', '-';
+            $archive = \"profile-downloader-$safeVer-windows.zip\";
+            $src = Join-Path dist $orig;
+            $dst = Join-Path dist ($orig + '-windows');
+            Move-Item $src $dst;
+            Compress-Archive -Path $dst -DestinationPath $archive;
+          "
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
