@@ -35,6 +35,7 @@ jobs:
         run: python scripts/generate_icons.py
 
       - name: Embed version into package
+        shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
