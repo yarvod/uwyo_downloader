@@ -1,4 +1,3 @@
-import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -19,27 +18,20 @@ class SoundingFetchResult:
         self.payload_json = payload_json
 
 
-async def fetch_sounding(
-    client: httpx.AsyncClient,
+def fetch_sounding(
+    client: httpx.Client,
     station_id: str | int,
     dt: datetime,
     output_dir: Path,
-    cancel_flag,
     save_to_disk: bool = True,
 ) -> Optional[SoundingFetchResult]:
-    if cancel_flag.is_set():
-        raise asyncio.CancelledError()
-
     params = {
         "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
         "id": str(station_id),
         "type": "TEXT:LIST",
     }
 
-    resp = await client.get(BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
-
-    if cancel_flag.is_set():
-        raise asyncio.CancelledError()
+    resp = client.get(BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
 
     if resp.status_code == 404:
         return None
@@ -66,13 +58,13 @@ async def fetch_sounding(
     return SoundingFetchResult(out_path, text_block, station_name, payload_json)
 
 
-def build_http_client(concurrency: int) -> httpx.AsyncClient:
+def build_http_client(concurrency: int) -> httpx.Client:
     timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT)
     limits = httpx.Limits(
         max_connections=concurrency,
         max_keepalive_connections=concurrency,
     )
-    return httpx.AsyncClient(
+    return httpx.Client(
         headers={"User-Agent": USER_AGENT},
         timeout=timeout,
         limits=limits,

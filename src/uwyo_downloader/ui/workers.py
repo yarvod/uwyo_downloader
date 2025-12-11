@@ -1,34 +1,67 @@
-import asyncio
-import threading
+import logging
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
+import httpx
 from sqlalchemy.exc import OperationalError
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 
 from ..config import DEFAULT_CONCURRENCY
-from ..db.repositories import StationRepository
+from ..db.repositories import SoundingRepository, StationRepository
 from ..models import SoundingRecord, StationInfo
 from ..services.soundings import SoundingFetchResult, build_http_client, fetch_sounding
 from ..services.stations import fetch_stations_for_datetime
-from dataclasses import dataclass
+from .state import SoundingPayload, add_sounding, reset_soundings, reset_stations, set_stations
+
+logger = logging.getLogger(__name__)
 
 
-class DownloadWorker(QObject):
-    progress = Signal(int, int, str)
-    finished = Signal(bool, str)
-    log = Signal(str)
-    persist_ready = Signal(list)
+def retry_on_lock(func: Callable, retries: int = 3, delay: float = 0.2):
+    """
+    Run DB action with small retry window to avoid UI hiccups on sqlite locks.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return func()
+        except OperationalError as exc:
+            msg = str(exc).lower()
+            if "database is locked" not in msg and "busy" not in msg:
+                raise
+            last_exc = exc
+            time.sleep(delay * (attempt + 1))
+    if last_exc:
+        raise last_exc
 
-    @dataclass
-    class DownloadedPayload:
-        station_id: str
-        captured_at: datetime
-        station_name: str
-        payload_json: str
-        path: Optional[Path]
+
+class Thread(QThread):
+    def pre_exit(self) -> None:
+        """
+        Hook that runs before any quit/exit/terminate.
+        """
+        pass
+
+    def terminate(self) -> None:  # type: ignore[override]
+        self.pre_exit()
+        super().terminate()
+        logger.info(f"[{self.__class__.__name__}.terminate] Terminated")
+
+    def quit(self) -> None:  # type: ignore[override]
+        self.pre_exit()
+        super().quit()
+        logger.info(f"[{self.__class__.__name__}.quit] Quited")
+
+    def exit(self, returnCode: int = 0) -> None:  # type: ignore[override]
+        self.pre_exit()
+        super().exit(returnCode)
+        logger.info(f"[{self.__class__.__name__}.exit] Exited")
+
+
+class DownloadThread(Thread):
+    progress = Signal(int, int)
+    done = Signal(bool, str)
 
     def __init__(
         self,
@@ -46,167 +79,84 @@ class DownloadWorker(QObject):
         self.concurrency = max(1, concurrency)
         self.station = station
         self.save_to_disk = save_to_disk
-        self._cancel_flag = threading.Event()
-        self._results: list[DownloadWorker.DownloadedPayload] = []
 
-    def cancel(self) -> None:
-        self._cancel_flag.set()
-
-    @staticmethod
-    def _retry_on_lock(func: Callable, retries: int = 3, delay: float = 0.2):
-        """
-        Run DB action with small retry window to avoid UI hiccups on sqlite locks.
-        """
-        last_exc: Exception | None = None
-        for attempt in range(retries):
-            try:
-                return func()
-            except OperationalError as exc:
-                msg = str(exc).lower()
-                if "database is locked" not in msg and "busy" not in msg:
-                    raise
-                last_exc = exc
-                time.sleep(delay * (attempt + 1))
-        if last_exc:
-            raise last_exc
-
-    def run(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._run())
-        except asyncio.CancelledError:
-            self.finished.emit(False, "Отменено")
-        except Exception as exc:  # noqa: BLE001
-            self.finished.emit(False, str(exc))
-        finally:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.close()
-
-    async def _run(self) -> None:
+    def run(self) -> None:  # noqa: D401
+        reset_soundings()
         if not self.datetimes:
-            self.finished.emit(False, "Нет дат для загрузки")
+            self.done.emit(False, "Нет дат для загрузки")
             return
-
         total = len(self.datetimes)
         done = 0
-        errors: List[str] = []
-
-        async with build_http_client(self.concurrency) as client:
-            sem = asyncio.Semaphore(self.concurrency)
-
-            async def bounded_fetch(dt: datetime):
-                if self._cancel_flag.is_set():
-                    raise asyncio.CancelledError()
-                async with sem:
+        errors: list[str] = []
+        fatal: Optional[str] = None
+        try:
+            with build_http_client(self.concurrency) as client:
+                for dt in self.datetimes:
                     try:
-                        result = await fetch_sounding(
+                        result = fetch_sounding(
                             client,
                             self.station_id,
                             dt,
                             self.output_dir,
-                            self._cancel_flag,
                             save_to_disk=self.save_to_disk,
                         )
-                        return dt, result, None
-                    except asyncio.CancelledError:
-                        raise
+                    except httpx.RequestError as exc:
+                        fatal = f"Сеть недоступна или соединение разорвано: {exc}"
+                        break
                     except Exception as exc:  # noqa: BLE001
-                        return dt, None, exc
-
-            tasks = [asyncio.create_task(bounded_fetch(dt)) for dt in self.datetimes]
-
-            try:
-                for coro in asyncio.as_completed(tasks):
-                    if self._cancel_flag.is_set():
-                        raise asyncio.CancelledError()
-                    dt, result, exc = await coro
-                    done += 1
-                    if isinstance(result, SoundingFetchResult):
-                        station_name = result.station_name or self.station.name
-                        self._results.append(
-                            DownloadWorker.DownloadedPayload(
-                                station_id=self.station_id,
-                                captured_at=dt,
-                                station_name=station_name,
-                                payload_json=result.payload_json,
-                                path=result.path,
-                            )
-                        )
-                        file_note = (
-                            f" -> {result.path.name}"
-                            if result.path
-                            else " (в памяти, без файла)"
-                        )
-                        self.log.emit(f"{dt:%Y-%m-%d %H:%M} скачано{file_note}")
-                    elif exc:
-                        msg = f"{dt:%Y-%m-%d %H:%M} ошибка: {exc}"
-                        errors.append(msg)
-                        self.log.emit(msg)
+                        errors.append(f"{dt:%Y-%m-%d %H:%M} ошибка: {exc}")
                     else:
-                        msg = f"{dt:%Y-%m-%d %H:%M} данных нет (404)"
-                        self.log.emit(msg)
-                    self.progress.emit(done, total, "")
-            except asyncio.CancelledError:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+                        if isinstance(result, SoundingFetchResult):
+                            station_name = result.station_name or self.station.name
+                            add_sounding(
+                                SoundingPayload(
+                                    station_id=self.station_id,
+                                    captured_at=dt,
+                                    station_name=station_name,
+                                    payload_json=result.payload_json,
+                                    path=result.path,
+                                )
+                            )
+                        else:
+                            errors.append(f"{dt:%Y-%m-%d %H:%M} данных нет (404)")
+                    done += 1
+                    self.progress.emit(done, total)
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(False, str(exc))
+            return
 
-        self.persist_ready.emit(self._results)
-        if self._cancel_flag.is_set():
-            self.finished.emit(False, "Отменено")
+        if fatal:
+            self.done.emit(False, fatal)
         elif errors:
-            self.finished.emit(False, "; ".join(errors[-3:]))
+            self.done.emit(False, "; ".join(errors[-3:]))
         else:
-            self.finished.emit(True, "Готово")
+            self.done.emit(True, "Готово")
+
+    def pre_exit(self) -> None:
+        # keep collected state for persistence in UI thread
+        pass
 
 
-class StationListWorker(QObject):
-    loaded = Signal(list)
-    failed = Signal(str)
-    canceled = Signal()
-    finished = Signal()
-    status = Signal(str)
+class StationThread(Thread):
+    done = Signal(bool, str)
 
-    def __init__(self, dt: datetime, session_factory: Callable) -> None:
+    def __init__(self, dt: datetime) -> None:
         super().__init__()
         self.dt = dt
-        self.session_factory = session_factory
-        self._cancel = threading.Event()
 
-    def _check_canceled(self) -> bool:
-        if self._cancel.is_set():
-            self.canceled.emit()
-            return True
-        return False
-
-    def run(self) -> None:
+    def run(self) -> None:  # noqa: D401
+        reset_stations()
         try:
-            self.status.emit("Запрашиваем станции у сервера...")
             stations = fetch_stations_for_datetime(self.dt)
-            if self._check_canceled():
-                return
-            self.status.emit(f"Получено {len(stations)} станций, пишем в БД...")
-            with self.session_factory() as session:
-                repo = StationRepository(session)
-                repo.upsert_many(stations)
-            if self._check_canceled():
-                return
-            self.status.emit("Читаем список станций из БД...")
-            with self.session_factory() as session:
-                repo = StationRepository(session)
-                db_stations = repo.list_all()
-            if self._check_canceled():
-                return
-            self.loaded.emit(db_stations)
+            set_stations(stations)
+            self.done.emit(True, f"Получено {len(stations)} станций")
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
+            reset_stations()
+            self.done.emit(False, str(exc))
 
-    def cancel(self) -> None:
-        self._cancel.set()
+    def pre_exit(self) -> None:
+        # keep any fetched data for UI thread to decide
+        pass
 
 
 class SoundingLoadWorker(QObject):
@@ -244,7 +194,7 @@ class SoundingLoadWorker(QObject):
                         limit=self.limit,
                     )
 
-            records = DownloadWorker._retry_on_lock(_read, retries=5, delay=0.15)
+            records = retry_on_lock(_read, retries=5, delay=0.15)
             self.loaded.emit(records)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))

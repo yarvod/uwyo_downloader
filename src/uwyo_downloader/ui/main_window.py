@@ -5,9 +5,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QDateTime, QThread, Qt
+from PySide6.QtCore import QDateTime, Qt
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QCompleter,
     QDateTimeEdit,
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenuBar,
     QMessageBox,
-    QPlainTextEdit,
     QProgressDialog,
     QProgressBar,
     QPushButton,
@@ -38,7 +38,8 @@ from ..di import Container
 from ..models import SoundingRecord, StationInfo
 from ..utils import build_datetimes
 from .style import BASE_STYLESHEET
-from .workers import DownloadWorker, StationListWorker
+from .state import drain_soundings, drain_stations
+from .workers import DownloadThread, StationThread, retry_on_lock
 
 
 class MainWindow(QMainWindow):
@@ -47,10 +48,10 @@ class MainWindow(QMainWindow):
         self.container = container
         self.setWindowTitle(f"UWYO Soundings Downloader v{APP_VERSION}")
         self.output_dir = DEFAULT_OUTPUT_DIR
-        self.download_thread: Optional[QThread] = None
-        self.download_worker: Optional[DownloadWorker] = None
-        self.station_thread: Optional[QThread] = None
-        self.station_worker: Optional[StationListWorker] = None
+        self.download_thread: Optional[DownloadThread] = None
+        self._download_handled = False
+        self.station_thread: Optional[StationThread] = None
+        self._station_handled = False
         self.station_progress: Optional[QProgressDialog] = None
         self.sounding_loading = False
         self.stations: List[StationInfo] = []
@@ -211,11 +212,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_label)
         layout.addWidget(self.progress_bar)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(500)
-        self.log.setPlaceholderText("Логи загрузки...")
-        layout.addWidget(self.log)
         layout.addStretch()
         return box
 
@@ -400,7 +396,7 @@ class MainWindow(QMainWindow):
             self.station_hint.setText("Станция не найдена в базе. Актуализируйте список.")
 
     def start_download(self) -> None:
-        if self.download_worker is not None:
+        if self.download_thread is not None:
             return
         query = self.station_input.text().strip()
         if not query:
@@ -426,82 +422,80 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Загрузка...")
         self.download_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self._download_handled = False
 
-        worker = DownloadWorker(
+        thread = DownloadThread(
             station.stationid,
             datetimes,
             Path(self.folder_input.text()),
             station,
             save_to_disk=self.save_to_folder_checkbox.isChecked(),
         )
-        thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self.on_progress)
-        worker.finished.connect(self.on_download_finished)
-        worker.log.connect(self.append_log)
-        worker.persist_ready.connect(self.on_download_results)
-        worker.finished.connect(lambda *_: thread.quit())
-        worker.finished.connect(lambda *_: worker.deleteLater())
-        thread.finished.connect(self._cleanup_download_thread)
-        thread.finished.connect(thread.deleteLater)
+        thread.progress.connect(self.on_progress)
+        thread.done.connect(self._on_download_done)
+        thread.finished.connect(lambda: self._on_download_finished("Остановлено"))
 
-        self.download_worker = worker
         self.download_thread = thread
         thread.start()
         self.station_hint.setText(f"{station.stationid} — {station.name}")
 
     def cancel_download(self) -> None:
-        if self.download_worker:
-            self.download_worker.cancel()
+        if self.download_thread:
+            self.download_thread.terminate()
             self.append_log("Останавливаем...")
 
-    def on_progress(self, current: int, total: int, _: str) -> None:
+    def on_progress(self, current: int, total: int) -> None:
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(current)
         self.progress_label.setText(f"{current}/{total}")
 
-    def on_download_finished(self, success: bool, message: str) -> None:
+    def _on_download_done(self, success: bool, message: str) -> None:
+        if self._download_handled:
+            return
+        self._download_handled = True
+        self._finalize_download(success, message)
+
+    def _on_download_finished(self, message: str) -> None:
+        if self._download_handled:
+            return
+        self._download_handled = True
+        self._finalize_download(False, message)
+
+    def _finalize_download(self, success: bool, message: str) -> None:
+        payloads = drain_soundings()
+        if payloads:
+            try:
+                def _write() -> int:
+                    with self.container.session() as session:
+                        station_repo = self.container.station_repo(session)
+                        sounding_repo = self.container.sounding_repo(session)
+                        saved = 0
+                        for item in payloads:
+                            station_repo.ensure_station(item.station_id, item.station_name)
+                            sounding_repo.upsert_sounding(
+                                station_id=item.station_id,
+                                station_name=item.station_name,
+                                captured_at=item.captured_at,
+                                payload_json=item.payload_json,
+                            )
+                            saved += 1
+                        return saved
+
+                saved = retry_on_lock(_write, retries=5, delay=0.15)
+                self.append_log(f"В БД записано профилей: {saved}")
+                self.load_soundings(reset_page=True)
+            except Exception as exc:  # noqa: BLE001
+                self.append_log(f"Ошибка сохранения в БД: {exc}")
         self.append_log(message)
         self.progress_label.setText(message)
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        self.download_worker = None
         self.download_thread = None
-
-    def on_download_results(self, payloads: list) -> None:
-        if not payloads:
-            return
-
-        def _write() -> int:
-            with self.container.session() as session:
-                station_repo = self.container.station_repo(session)
-                sounding_repo = self.container.sounding_repo(session)
-                saved = 0
-                for item in payloads:
-                    station_repo.ensure_station(item.station_id, item.station_name)
-                    sounding_repo.upsert_sounding(
-                        station_id=item.station_id,
-                        station_name=item.station_name,
-                        captured_at=item.captured_at,
-                        payload_json=item.payload_json,
-                    )
-                    saved += 1
-                return saved
-
-        try:
-            saved = DownloadWorker._retry_on_lock(_write, retries=5, delay=0.15)
-            self.append_log(f"В БД записано профилей: {saved}")
-            self.load_soundings(reset_page=True)
-        except Exception as exc:  # noqa: BLE001
-            self.append_log(f"Ошибка сохранения в БД: {exc}")
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         line = f"[{stamp}] {message}"
         print(line, flush=True)
-        self.log.appendPlainText(line)
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def _toggle_folder_inputs(self, checked: bool | int) -> None:
         visible = bool(checked)
@@ -510,7 +504,7 @@ class MainWindow(QMainWindow):
             self.folder_row_widget.setVisible(visible)
 
     def load_stations(self) -> None:
-        if self.station_worker is not None:
+        if self.station_thread is not None:
             return
         dt = self._to_hour_datetime(self.stations_dt.dateTime())
         self.station_status.setText("Загрузка списка...")
@@ -518,44 +512,59 @@ class MainWindow(QMainWindow):
         self.station_table.setEnabled(False)
         self.station_filter_input.setEnabled(False)
         self._show_station_progress("Загрузка списка станций...")
+        self._station_handled = False
 
-        worker = StationListWorker(dt, self.container.session)
-        thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.loaded.connect(self.on_stations_loaded)
-        worker.failed.connect(self.on_stations_failed)
-        worker.canceled.connect(self.on_stations_canceled)
-        worker.status.connect(self.on_station_status)
-        worker.finished.connect(lambda: thread.quit())
-        worker.finished.connect(lambda: worker.deleteLater())
-        thread.finished.connect(thread.deleteLater)
+        thread = StationThread(dt)
+        thread.done.connect(self._on_stations_done)
+        thread.finished.connect(lambda: self._on_stations_finished("Отменено"))
 
-        self.station_worker = worker
         self.station_thread = thread
         thread.start()
 
-    def on_stations_loaded(self, stations: List[StationInfo]) -> None:
-        self.stations = stations
-        self.populate_station_table()
-        self.refresh_station_completers()
-        self._finish_station_update(f"Станций в базе: {len(stations)}")
+    def _on_stations_done(self, success: bool, message: str) -> None:
+        if self._station_handled:
+            return
+        self._station_handled = True
+        self._finalize_stations(success, message)
 
-    def on_stations_failed(self, message: str) -> None:
-        self.append_log(f"Ошибка загрузки списка станций: {message}")
-        self._finish_station_update(f"Ошибка: {message}")
+    def _on_stations_finished(self, message: str) -> None:
+        if self._station_handled:
+            return
+        self._station_handled = True
+        self._finalize_stations(False, message)
 
-    def on_stations_canceled(self) -> None:
-        self.append_log("Загрузка списка станций отменена")
-        self._finish_station_update("Отменено")
+    def _finalize_stations(self, success: bool, message: str) -> None:
+        stations = drain_stations()
+        if success and stations:
+            try:
+                def _write() -> int:
+                    with self.container.session() as session:
+                        repo = self.container.station_repo(session)
+                        return repo.upsert_many(stations)
 
-    def on_station_status(self, message: str) -> None:
-        self.append_log(message)
-        if self.station_progress:
-            self.station_progress.setLabelText(message)
+                saved = retry_on_lock(_write, retries=5, delay=0.15)
+                self.append_log(f"Станций сохранено: {saved}")
+            except Exception as exc:  # noqa: BLE001
+                self.append_log(f"Ошибка сохранения станций: {exc}")
+                self._finish_station_update(f"Ошибка: {exc}")
+                self.station_thread = None
+                return
+            try:
+                with self.container.session() as session:
+                    repo = self.container.station_repo(session)
+                    db_stations = repo.list_all()
+                self.stations = db_stations
+                self.populate_station_table()
+                self.refresh_station_completers()
+                self._finish_station_update(f"Станций в базе: {len(db_stations)}")
+            except Exception as exc:  # noqa: BLE001
+                self.append_log(f"Ошибка чтения БД: {exc}")
+                self._finish_station_update(f"Ошибка: {exc}")
+        else:
+            self.append_log(message)
+            self._finish_station_update(message)
 
     def _finish_station_update(self, status: Optional[str] = None) -> None:
-        self.station_worker = None
         self.station_thread = None
         if status is not None:
             self.station_status.setText(status)
@@ -673,12 +682,6 @@ class MainWindow(QMainWindow):
             )
         return matches[0]
 
-    def _cleanup_download_thread(self) -> None:
-        self.download_thread = None
-        self.download_worker = None
-        self.download_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-
     def load_soundings(self, reset_page: bool = False) -> None:
         if self.sounding_loading:
             return
@@ -721,9 +724,7 @@ class MainWindow(QMainWindow):
                     self.total_records = total
                     return records, total
 
-            records, _ = DownloadWorker._retry_on_lock(
-                _read_soundings, retries=5, delay=0.1
-            )
+            records, _ = retry_on_lock(_read_soundings, retries=5, delay=0.1)
             self.sounding_records = records
             self.populate_sounding_table()
             self._update_pagination()
@@ -829,9 +830,9 @@ class MainWindow(QMainWindow):
             self.station_progress = None
 
     def _cancel_station_update(self) -> None:
-        if self.station_worker:
+        if self.station_thread:
             try:
-                self.station_worker.cancel()
+                self.station_thread.terminate()
                 self.append_log("Останавливаем актуализацию станций...")
             except Exception:  # noqa: BLE001
                 pass
