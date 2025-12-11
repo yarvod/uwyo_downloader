@@ -9,10 +9,12 @@ import numpy as np
 from pyqtgraph import PlotWidget, mkPen
 from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
 from PySide6.QtCore import QDateTime, Qt
-from PySide6.QtGui import QColor, QIcon, QPalette
+from PySide6.QtCore import QEvent
+from PySide6.QtGui import QColor, QFontMetrics, QIcon, QPalette, QStandardItem
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QCompleter,
     QDateTimeEdit,
     QDialog,
@@ -35,6 +37,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -46,6 +49,117 @@ from ..utils import build_datetimes, make_filename
 from .style import BASE_STYLESHEET
 from .state import drain_soundings, drain_stations
 from .workers import DownloadThread, StationThread, retry_on_lock
+
+
+class MultipleComboBox(QComboBox):
+    class Delegate(QStyledItemDelegate):
+        def sizeHint(self, option, index):
+            size = super().sizeHint(option, index)
+            size.setHeight(20)
+            return size
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.setItemDelegate(MultipleComboBox.Delegate())
+        self.model().dataChanged.connect(self.updateText)
+        self.lineEdit().installEventFilter(self)
+        self.closeOnLineEditClick = False
+
+    def resizeEvent(self, event):
+        self.updateText()
+        super().resizeEvent(event)
+
+    def eventFilter(self, obj, event):
+        if obj == self.lineEdit():
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                if self.closeOnLineEditClick:
+                    self.hidePopup()
+                else:
+                    self.showPopup()
+                return True
+            return False
+        if obj == self.view().viewport():
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                index = self.view().indexAt(event.pos())
+                item = self.model().item(index.row())
+                if item.checkState() == Qt.CheckState.Checked:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                else:
+                    item.setCheckState(Qt.CheckState.Checked)
+                return True
+        return False
+
+    def showPopup(self):
+        super().showPopup()
+        self.closeOnLineEditClick = True
+
+    def hidePopup(self):
+        super().hidePopup()
+        self.startTimer(100)
+        self.updateText()
+
+    def timerEvent(self, event):
+        self.killTimer(event.timerId())
+        self.closeOnLineEditClick = False
+
+    def updateText(self):
+        texts = []
+        for i in range(self.model().rowCount()):
+            if self.model().item(i).checkState() == Qt.CheckState.Checked:
+                texts.append(self.model().item(i).text())
+        text = ", ".join(texts)
+        metrics = QFontMetrics(self.lineEdit().font())
+        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, self.lineEdit().width())
+        self.lineEdit().setText(elided)
+
+    def addItem(self, text, data=None):  # type: ignore[override]
+        item = QStandardItem()
+        item.setText(text)
+        item.setData(text if data is None else data)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setData(Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        self.model().appendRow(item)
+
+    def addItems(self, texts, datalist=None):  # type: ignore[override]
+        for i, text in enumerate(texts):
+            try:
+                data = datalist[i]
+            except Exception:
+                data = None
+            self.addItem(text, data)
+
+    def apply_filter(self, query: str) -> None:
+        q = query.lower().strip()
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            text = item.text().lower()
+            hidden = q not in text if q else False
+            self.view().setRowHidden(i, hidden)
+
+    def clear_checks(self):
+        for i in range(self.model().rowCount()):
+            self.model().item(i).setData(Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        self.updateText()
+
+    def clear(self):  # type: ignore[override]
+        self.model().clear()
+        self.setEditText("")
+
+    def currentData(self):  # type: ignore[override]
+        res = []
+        for i in range(self.model().rowCount()):
+            if self.model().item(i).checkState() == Qt.CheckState.Checked:
+                res.append(self.model().item(i).data())
+        return res
+
+    def currentOptions(self):
+        res = []
+        for i in range(self.model().rowCount()):
+            if self.model().item(i).checkState() == Qt.CheckState.Checked:
+                res.append((self.model().item(i).text(), self.model().item(i).data()))
+        return res
 
 
 class MainWindow(QMainWindow):
@@ -311,19 +425,29 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Станция:"))
-        self.sounding_station_search = QLineEdit()
-        self.sounding_station_search.setPlaceholderText("Поиск по ID или названию (БД)")
-        self.sounding_station_search.returnPressed.connect(
-            lambda: self.load_soundings(reset_page=True)
+        filter_col = QVBoxLayout()
+        filter_row_top = QHBoxLayout()
+        self.sounding_station_search_input = QLineEdit()
+        self.sounding_station_search_input.setPlaceholderText("Фильтр по названию или ID")
+        self.sounding_station_search_input.textChanged.connect(
+            lambda text: self.sounding_station_multi.apply_filter(text)
         )
-        filter_row.addWidget(self.sounding_station_search)
-        filter_row.addStretch()
-        self.apply_filters_btn = QPushButton("Найти")
-        self.apply_filters_btn.clicked.connect(lambda: self.load_soundings(reset_page=True))
-        filter_row.addWidget(self.apply_filters_btn)
-        layout.addLayout(filter_row)
+        filter_row_top.addWidget(self.sounding_station_search_input)
+        reset_stations_btn = QPushButton("Сброс")
+        reset_stations_btn.clicked.connect(self.reset_sounding_filters)
+        filter_row_top.addWidget(reset_stations_btn)
+        filter_col.addLayout(filter_row_top)
+
+        filter_row_bottom = QHBoxLayout()
+        self.sounding_station_multi = MultipleComboBox()
+        self.sounding_station_multi.setMinimumWidth(220)
+        self.sounding_station_multi.model().dataChanged.connect(
+            lambda *_: self.load_soundings(reset_page=True)
+        )
+        filter_row_bottom.addWidget(self.sounding_station_multi)
+        filter_row_bottom.addStretch()
+        filter_col.addLayout(filter_row_bottom)
+        layout.addLayout(filter_col)
 
         pagination_row = QHBoxLayout()
         self.prev_page_btn = QPushButton("← Назад")
@@ -681,12 +805,14 @@ class MainWindow(QMainWindow):
         completer.activated.connect(self._on_station_completed)
         self.station_input.setCompleter(completer)
 
-        if hasattr(self, "sounding_station_search"):
-            alt = QCompleter(suggestions, self)
-            alt.setCaseSensitivity(Qt.CaseInsensitive)
-            alt.setFilterMode(Qt.MatchContains)
-            alt.activated.connect(self._on_sounding_search_completed)
-            self.sounding_station_search.setCompleter(alt)
+        if hasattr(self, "sounding_station_multi"):
+            self.sounding_station_multi.clear()
+            labels = [f"{s.stationid} — {s.name}" for s in self.stations]
+            ids = [s.stationid for s in self.stations]
+            self.sounding_station_multi.addItems(labels, ids)
+            # сбрасываем поиск
+            if hasattr(self, "sounding_station_search_input"):
+                self.sounding_station_search_input.clear()
 
     def _on_station_completed(self, text: str) -> None:
         station_id = self._extract_station_id(text)
@@ -694,10 +820,6 @@ class MainWindow(QMainWindow):
         station = self.resolve_station(station_id)
         if station:
             self.station_hint.setText(f"{station.stationid} — {station.name}")
-
-    def _on_sounding_search_completed(self, text: str) -> None:
-        station_id = self._extract_station_id(text)
-        self.sounding_station_search.setText(station_id)
 
     def resolve_station(self, query: str) -> Optional[StationInfo]:
         cleaned = query.strip()
@@ -727,20 +849,16 @@ class MainWindow(QMainWindow):
             self.current_page = 1
         self.sounding_loading = True
         try:
-            station_query = self.sounding_station_search.text().strip() or None
+            selected_ids = []
+            if hasattr(self, "sounding_station_multi"):
+                selected_ids = [
+                    self._extract_station_id(str(sid)) for sid in self.sounding_station_multi.currentData()
+                ]
+                selected_ids = [sid for sid in selected_ids if sid]
 
             def _read_soundings() -> tuple[list[SoundingRecord], int]:
                 with self.container.session() as session:
-                    station_ids: Optional[list[str]] = None
-                    if station_query:
-                        parsed_id = self._extract_station_id(station_query)
-                        station_repo = self.container.station_repo(session)
-                        if parsed_id and not station_repo.get_by_id(parsed_id):
-                            self.current_page = 1
-                            self.total_pages = 1
-                            self.total_records = 0
-                            return [], 0
-                        station_ids = [parsed_id] if parsed_id else None
+                    station_ids: Optional[list[str]] = selected_ids or None
                     repo = self.container.sounding_repo(session)
                     total = repo.count(
                         station_ids=station_ids,
@@ -828,7 +946,10 @@ class MainWindow(QMainWindow):
         self.next_page_btn.setEnabled(self.current_page < self.total_pages)
 
     def reset_sounding_filters(self) -> None:
-        self.sounding_station_search.clear()
+        if hasattr(self, "sounding_station_multi"):
+            self.sounding_station_multi.clear_checks()
+        if hasattr(self, "sounding_station_search_input"):
+            self.sounding_station_search_input.clear()
         self.load_soundings(reset_page=True)
 
     def display_payload(self, record: SoundingRecord) -> None:
@@ -1076,9 +1197,18 @@ class PWVDialog(QDialog):
         self.min_height_input.setSingleStep(10)
         self.min_height_input.valueChanged.connect(self._replot)
 
+        self.offset_input = QDoubleSpinBox(self)
+        self.offset_input.setRange(-48, 48)
+        self.offset_input.setValue(0.0)
+        self.offset_input.setSuffix(" ч от UTC")
+        self.offset_input.setSingleStep(1)
+        self.offset_input.valueChanged.connect(self._replot)
+
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Высота от:"))
         top_row.addWidget(self.min_height_input)
+        top_row.addWidget(QLabel("Смещение времени:"))
+        top_row.addWidget(self.offset_input)
         top_row.addStretch()
 
         self.status_label = QLabel("")
@@ -1115,7 +1245,7 @@ class PWVDialog(QDialog):
                 pwv = self.compute_func(rec, min_h)
                 if pwv is None:
                     continue
-                ts = rec.captured_at.timestamp()
+                ts = rec.captured_at.timestamp() + float(self.offset_input.value()) * 3600
                 points.append((ts, pwv))
             if not points:
                 continue
