@@ -4,12 +4,13 @@ import sys
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
+from .di import get_container
 from .ui.main_window import MainWindow
 
 
 def _prepare_env() -> None:
     """
-    Небольшая стабилизация QtWebEngine на macOS: отключаем GPU рендер,
+    Небольшая стабилизация Qt на macOS: отключаем GPU рендер и
     шарим GL-контексты между окнами.
     """
     os.environ.setdefault(
@@ -20,18 +21,11 @@ def _prepare_env() -> None:
 
 
 def main() -> None:
-    if "--map-process" in sys.argv:
-        idx = sys.argv.index("--map-process")
-        sys.argv = [sys.argv[0]] + sys.argv[idx + 1 :]
-        _prepare_env()
-        from .ui.map_process import run_map_process
-
-        run_map_process(sys.argv[1:])
-        return
-
     _prepare_env()
+    container = get_container()
+    container.ensure_ready()
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(container)
     window.show()
     sys.exit(app.exec())
 

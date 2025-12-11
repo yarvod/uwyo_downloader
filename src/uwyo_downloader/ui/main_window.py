@@ -1,57 +1,69 @@
+from __future__ import annotations
+
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import QDateTime, QThread, Qt
-from PySide6.QtGui import QColor, QPalette, QIcon
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
+    QCompleter,
+    QDateTimeEdit,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QPushButton,
+    QMenuBar,
+    QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QProgressBar,
+    QPushButton,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
-    QDateTimeEdit,
-    QMenuBar,
-    QMessageBox,
-    QLineEdit,
 )
 
-from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR, USE_MAP_SUBPROCESS
-from ..models import StationInfo
+from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
+from ..di import Container
+from ..models import SoundingRecord, StationInfo
 from ..utils import build_datetimes
-from .map_view import StationMapProcessHost, StationMapView
-from .workers import DownloadWorker, StationListWorker
+from .workers import DownloadWorker, SoundingLoadWorker, StationListWorker
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, container: Container) -> None:
         super().__init__()
+        self.container = container
         self.setWindowTitle(f"UWYO Soundings Downloader v{APP_VERSION}")
         self.output_dir = DEFAULT_OUTPUT_DIR
         self.download_thread: Optional[QThread] = None
         self.download_worker: Optional[DownloadWorker] = None
         self.station_thread: Optional[QThread] = None
         self.station_worker: Optional[StationListWorker] = None
+        self.station_progress: Optional[QProgressDialog] = None
+        self.sounding_thread: Optional[QThread] = None
+        self.sounding_worker = None
         self.stations: List[StationInfo] = []
-        self.station_row_index: dict[str, int] = {}
-        self.filtered_rows: List[int] = []
+        self.sounding_records: List[SoundingRecord] = []
         self.icon_path = self._asset_path("assets/icons/icon-256.png")
+
         self.build_ui()
         self.apply_palette()
         self.build_menu()
         if self.icon_path:
             self.setWindowIcon(QIcon(self.icon_path))
+
+        self.refresh_station_cache()
+        self.load_soundings()
 
     def build_ui(self) -> None:
         main_widget = QWidget()
@@ -59,11 +71,11 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(4)
         splitter.addWidget(self.build_download_panel())
-        splitter.addWidget(self.build_map_panel())
-        splitter.setSizes([420, 620])
+        splitter.addWidget(self.build_side_panel())
+        splitter.setSizes([400, 520])
         main_layout.addWidget(splitter)
         self.setCentralWidget(main_widget)
-        self.resize(1200, 720)
+        self.resize(1050, 700)
 
     @staticmethod
     def _to_datetime(qdatetime):
@@ -122,11 +134,17 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
 
         station_row = QHBoxLayout()
-        station_row.addWidget(QLabel("ID станции:"))
+        station_row.addWidget(QLabel("Станция:"))
         self.station_input = QLineEdit()
-        self.station_input.setPlaceholderText("например, 51076")
+        self.station_input.setPlaceholderText("ID или название из базы")
         station_row.addWidget(self.station_input)
+        self.station_lookup_btn = QPushButton("Найти")
+        self.station_lookup_btn.clicked.connect(self.try_resolve_station)
+        station_row.addWidget(self.station_lookup_btn)
         layout.addLayout(station_row)
+
+        self.station_hint = QLabel("")
+        layout.addWidget(self.station_hint)
 
         dates_row = QHBoxLayout()
         start_dt_default = self._current_synoptic_qdatetime().addDays(-1)
@@ -185,60 +203,130 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return box
 
-    def build_map_panel(self) -> QWidget:
-        box = QGroupBox("Карта станций")
+    def build_side_panel(self) -> QWidget:
+        box = QGroupBox("Локальные данные")
         layout = QVBoxLayout(box)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.build_stations_tab(), "Станции")
+        self.tabs.addTab(self.build_data_tab(), "Профили")
+        layout.addWidget(self.tabs)
+        return box
 
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("Дата/время:"))
-        stations_dt_default = self._current_synoptic_qdatetime()
-        self.stations_dt = QDateTimeEdit(stations_dt_default)
+    def build_stations_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        control_row = QHBoxLayout()
+        control_row.addWidget(QLabel("Дата/время:"))
+        self.stations_dt = QDateTimeEdit(self._current_synoptic_qdatetime())
         self.stations_dt.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.stations_dt.setCalendarPopup(True)
-        top_row.addWidget(self.stations_dt)
-        self.load_stations_btn = QPushButton("Показать станции")
+        control_row.addWidget(self.stations_dt)
+        self.load_stations_btn = QPushButton("Актуализировать")
         self.load_stations_btn.clicked.connect(self.load_stations)
-        top_row.addWidget(self.load_stations_btn)
-        layout.addLayout(top_row)
+        control_row.addWidget(self.load_stations_btn)
+        layout.addLayout(control_row)
 
-        self.map_view = (
-            StationMapProcessHost() if USE_MAP_SUBPROCESS else StationMapView()
-        )
-        if isinstance(self.map_view, StationMapProcessHost):
-            self.map_view.setMinimumHeight(120)
-        self.map_view.stationClicked.connect(self.on_map_station_clicked)
-        layout.addWidget(self.map_view)
-
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Поиск:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Введите название или ID станции")
-        self.search_input.textChanged.connect(self.apply_filter)
-        filter_row.addWidget(self.search_input)
-        layout.addLayout(filter_row)
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Поиск:"))
+        self.station_filter_input = QLineEdit()
+        self.station_filter_input.setPlaceholderText("Фильтр по названию или ID")
+        self.station_filter_input.textChanged.connect(self.apply_station_filter)
+        search_row.addWidget(self.station_filter_input)
+        layout.addLayout(search_row)
 
         self.station_table = QTableWidget()
-        self.station_table.setColumnCount(5)
+        self.station_table.setColumnCount(6)
         self.station_table.setHorizontalHeaderLabels(
-            ["ID", "Название", "Источник", "Широта", "Долгота"]
+            ["ID", "Название", "Источник", "Обновлено", "Широта", "Долгота"]
         )
         self.station_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.station_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.station_table.horizontalHeader().setStretchLastSection(True)
+        header: QHeaderView = self.station_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(50)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(1, 200)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.station_table.itemSelectionChanged.connect(self.fill_station_from_selection)
+        self.station_table.setHorizontalScrollMode(
+            QTableWidget.ScrollMode.ScrollPerPixel
+        )
+        self.station_table.setSizeAdjustPolicy(
+            QTableWidget.SizeAdjustPolicy.AdjustIgnored
+        )
         layout.addWidget(self.station_table)
-        # делаем таблицу выше, карта в отдельном процессе занимает мало места
-        layout.setStretch(1, 1)  # карта/контейнер
-        layout.setStretch(3, 5)  # таблица
+        layout.setStretch(2, 1)
 
         bottom_row = QHBoxLayout()
-        self.download_selected_btn = QPushButton("Скачать выбранную")
-        self.download_selected_btn.clicked.connect(self.download_selected_station)
-        bottom_row.addWidget(self.download_selected_btn)
         self.station_status = QLabel("")
         bottom_row.addWidget(self.station_status)
+        bottom_row.addStretch()
         layout.addLayout(bottom_row)
-        return box
+        return tab
+
+    def build_data_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Станция:"))
+        self.sounding_station_search = QLineEdit()
+        self.sounding_station_search.setPlaceholderText("Поиск по ID или названию (БД)")
+        filter_row.addWidget(self.sounding_station_search)
+        filter_row.addStretch()
+        self.apply_filters_btn = QPushButton("Применить")
+        self.apply_filters_btn.clicked.connect(self.load_soundings)
+        self.reset_filters_btn = QPushButton("Сброс")
+        self.reset_filters_btn.clicked.connect(self.reset_sounding_filters)
+        filter_row.addWidget(self.apply_filters_btn)
+        filter_row.addWidget(self.reset_filters_btn)
+        layout.addLayout(filter_row)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        self.sounding_table = QTableWidget()
+        self.sounding_table.setColumnCount(4)
+        self.sounding_table.setHorizontalHeaderLabels(
+            ["ID", "Станция", "Дата", "Загружено"]
+        )
+        self.sounding_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sounding_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        header: QHeaderView = self.sounding_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(50)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(1, 160)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.sounding_table.itemSelectionChanged.connect(
+            self.on_sounding_selection_changed
+        )
+        self.sounding_table.setHorizontalScrollMode(
+            QTableWidget.ScrollMode.ScrollPerPixel
+        )
+        self.sounding_table.setAutoScroll(True)
+        self.sounding_table.setSizeAdjustPolicy(
+            QTableWidget.SizeAdjustPolicy.AdjustIgnored
+        )
+        splitter.addWidget(self.sounding_table)
+
+        self.payload_table = QTableWidget()
+        self.payload_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.payload_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.payload_table.horizontalHeader().setStretchLastSection(False)
+        self.payload_table.horizontalHeader().setMinimumSectionSize(50)
+        splitter.addWidget(self.payload_table)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
+
+        return tab
 
     def build_menu(self) -> None:
         menu_bar: QMenuBar = self.menuBar()
@@ -269,7 +357,7 @@ class MainWindow(QMainWindow):
             QGroupBox { border: 1px solid #1f2937; border-radius: 8px; margin-top: 12px; padding: 12px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #9ca3af; }
             QLabel { color: #e5e7eb; }
-            QLineEdit, QDateTimeEdit, QPlainTextEdit, QSpinBox, QTableWidget {
+            QLineEdit, QDateTimeEdit, QPlainTextEdit, QSpinBox, QTableWidget, QComboBox {
                 background: #0f172a; border: 1px solid #1f2937; color: #e5e7eb; border-radius: 6px; padding: 6px;
             }
             QPushButton {
@@ -291,12 +379,26 @@ class MainWindow(QMainWindow):
             self.output_dir = Path(selected)
             self.folder_input.setText(selected)
 
+    def try_resolve_station(self) -> None:
+        query = self.station_input.text().strip()
+        station = self.resolve_station(query)
+        if station:
+            self.station_input.setText(station.stationid)
+            self.station_hint.setText(f"{station.stationid} — {station.name}")
+        else:
+            self.station_hint.setText("Станция не найдена в базе. Актуализируйте список.")
+
     def start_download(self) -> None:
         if self.download_worker is not None:
             return
-        station_id = self.station_input.text().strip()
-        if not station_id:
+        query = self.station_input.text().strip()
+        if not query:
             self.append_log("Укажите ID станции.")
+            return
+        station = self.resolve_station(query)
+        if station is None:
+            self.append_log("Станция не найдена в базе. Обновите список станций.")
+            self.station_hint.setText("Станция не найдена в базе.")
             return
         try:
             datetimes = build_datetimes(
@@ -313,9 +415,14 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Загрузка...")
         self.download_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self.download_selected_btn.setEnabled(False)
 
-        worker = DownloadWorker(station_id, datetimes, Path(self.folder_input.text()))
+        worker = DownloadWorker(
+            station.stationid,
+            datetimes,
+            Path(self.folder_input.text()),
+            station,
+            self.container.session,
+        )
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -330,6 +437,7 @@ class MainWindow(QMainWindow):
         self.download_worker = worker
         self.download_thread = thread
         thread.start()
+        self.station_hint.setText(f"{station.stationid} — {station.name}")
 
     def cancel_download(self) -> None:
         if self.download_worker:
@@ -346,12 +454,15 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(message)
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        self.download_selected_btn.setEnabled(True)
-        # download_worker/thread cleanup happens in _cleanup_download_thread
+        self.download_worker = None
+        self.download_thread = None
+        self.load_soundings()
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
-        self.log.appendPlainText(f"[{stamp}] {message}")
+        line = f"[{stamp}] {message}"
+        print(line, flush=True)
+        self.log.appendPlainText(line)
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def load_stations(self) -> None:
@@ -359,21 +470,19 @@ class MainWindow(QMainWindow):
             return
         dt = self._to_hour_datetime(self.stations_dt.dateTime())
         self.station_status.setText("Загрузка списка...")
-        self.map_view.set_stations([])
-        self.station_table.setRowCount(0)
-        self.download_selected_btn.setEnabled(False)
         self.load_stations_btn.setEnabled(False)
-        self.map_view.setEnabled(False)
         self.station_table.setEnabled(False)
-        if hasattr(self, "search_input"):
-            self.search_input.setEnabled(False)
+        self.station_filter_input.setEnabled(False)
+        self._show_station_progress("Загрузка списка станций...")
 
-        worker = StationListWorker(dt)
+        worker = StationListWorker(dt, self.container.session)
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.loaded.connect(self.on_stations_loaded)
         worker.failed.connect(self.on_stations_failed)
+        worker.canceled.connect(self.on_stations_canceled)
+        worker.status.connect(self.on_station_status)
         worker.finished.connect(lambda: thread.quit())
         worker.finished.connect(lambda: worker.deleteLater())
         thread.finished.connect(thread.deleteLater)
@@ -382,44 +491,34 @@ class MainWindow(QMainWindow):
         self.station_thread = thread
         thread.start()
 
-    def on_stations_loaded(self, stations: List[StationInfo], map_html: str) -> None:
+    def on_stations_loaded(self, stations: List[StationInfo]) -> None:
         self.stations = stations
-        self.station_row_index = {s.stationid: idx for idx, s in enumerate(stations)}
-        self.station_status.setText(f"Найдено станций: {len(stations)}")
-        self.station_table.setRowCount(len(stations))
-        self.filtered_rows = list(range(len(stations)))
-        for row, station in enumerate(stations):
-            self.station_table.setItem(row, 0, QTableWidgetItem(station.stationid))
-            self.station_table.setItem(row, 1, QTableWidgetItem(station.name))
-            self.station_table.setItem(row, 2, QTableWidgetItem(station.src or ""))
-            self.station_table.setItem(
-                row, 3, QTableWidgetItem(f"{station.lat:.2f}" if station.lat else "")
-            )
-            self.station_table.setItem(
-                row, 4, QTableWidgetItem(f"{station.lon:.2f}" if station.lon else "")
-            )
-        self.apply_filter()
-        self.map_view.set_html(map_html)
-        self.download_selected_btn.setEnabled(True)
-        self.station_worker = None
-        self.station_thread = None
-        self.load_stations_btn.setEnabled(True)
-        self.map_view.setEnabled(True)
-        self.station_table.setEnabled(True)
-        if hasattr(self, "search_input"):
-            self.search_input.setEnabled(True)
+        self.populate_station_table()
+        self.refresh_station_completers()
+        self._finish_station_update(f"Станций в базе: {len(stations)}")
 
     def on_stations_failed(self, message: str) -> None:
-        self.station_status.setText(f"Ошибка: {message}")
         self.append_log(f"Ошибка загрузки списка станций: {message}")
-        self.download_selected_btn.setEnabled(True)
+        self._finish_station_update(f"Ошибка: {message}")
+
+    def on_stations_canceled(self) -> None:
+        self.append_log("Загрузка списка станций отменена")
+        self._finish_station_update("Отменено")
+
+    def on_station_status(self, message: str) -> None:
+        self.append_log(message)
+        if self.station_progress:
+            self.station_progress.setLabelText(message)
+
+    def _finish_station_update(self, status: Optional[str] = None) -> None:
         self.station_worker = None
         self.station_thread = None
+        if status is not None:
+            self.station_status.setText(status)
         self.load_stations_btn.setEnabled(True)
-        self.map_view.setEnabled(True)
         self.station_table.setEnabled(True)
-        if hasattr(self, "search_input"):
-            self.search_input.setEnabled(True)
+        self.station_filter_input.setEnabled(True)
+        self._close_station_progress()
 
     def fill_station_from_selection(self) -> None:
         items = self.station_table.selectedItems()
@@ -427,76 +526,243 @@ class MainWindow(QMainWindow):
             return
         station_id = items[0].text()
         self.station_input.setText(station_id)
+        station = self.resolve_station(station_id)
+        if station:
+            self.station_hint.setText(f"{station.stationid} — {station.name}")
 
-    def download_selected_station(self) -> None:
-        if self.station_worker is not None:
-            self.append_log("Дождитесь загрузки списка станций.")
-            return
-        if self.download_worker is not None:
-            self.append_log("Уже идет загрузка — дождитесь завершения.")
-            return
-
-        selection = self.station_table.selectionModel().selectedRows()
-        if not selection:
-            self.append_log("Выберите станцию из списка.")
-            return
-        row = selection[0].row()
-        station = self.stations[row]
-        self.station_input.setText(station.stationid)
-        self.start_dt.setDateTime(self.stations_dt.dateTime())
-        self.end_dt.setDateTime(self.stations_dt.dateTime())
-        self.step_input.setValue(12)
-        self.append_log(
-            f"Скачиваем {station.stationid} за {self.stations_dt.dateTime().toString('yyyy-MM-dd HH:mm')}"
-        )
-        self.start_download()
-
-    def on_map_station_clicked(self, station_id: str) -> None:
-        """
-        Обработчик клика по маркеру на карте: выбираем станцию и подсвечиваем в таблице.
-        """
-        self.station_input.setText(station_id)
-        target_row = self.station_row_index.get(station_id)
-        if target_row is None:
-            for row in range(self.station_table.rowCount()):
-                item = self.station_table.item(row, 0)
-                if item and item.text() == station_id:
-                    target_row = row
-                    break
-        if target_row is not None:
-            item = self.station_table.item(target_row, 0)
-            if item:
-                self.station_table.selectRow(target_row)
-                self.station_table.scrollToItem(item)
-        # Продублируем установку ID, чтобы точно попасть в поле даже если сигнал пришел позже.
-        self.station_input.setText(station_id)
-        self.append_log(f"Выбрана станция {station_id} с карты")
-    def apply_filter(self) -> None:
-        """
-        Простая фильтрация строк станции по подстроке в ID/названии.
-        """
-        if not hasattr(self, "station_table"):
-            return
-        query = self.search_input.text().strip().lower() if hasattr(self, "search_input") else ""
+    def apply_station_filter(self) -> None:
+        query = self.station_filter_input.text().strip().lower()
         row_count = self.station_table.rowCount()
         visible_rows: List[int] = []
+        self.station_table.setUpdatesEnabled(False)
         for row in range(row_count):
             id_item = self.station_table.item(row, 0)
             name_item = self.station_table.item(row, 1)
-            hay = ((id_item.text() if id_item else "") + " " + (name_item.text() if name_item else "")).lower()
+            hay = (
+                (id_item.text() if id_item else "")
+                + " "
+                + (name_item.text() if name_item else "")
+            ).lower()
             visible = query in hay
             self.station_table.setRowHidden(row, not visible)
             if visible:
                 visible_rows.append(row)
-        self.filtered_rows = visible_rows
+        if visible_rows:
+            self.station_table.selectRow(visible_rows[0])
+        self.station_table.setUpdatesEnabled(True)
+
+    def refresh_station_cache(self) -> None:
+        try:
+            with self.container.session() as session:
+                repo = self.container.station_repo(session)
+                self.stations = repo.list_all()
+                self.populate_station_table()
+                self.refresh_station_completers()
+                self.station_status.setText(f"Станций в базе: {len(self.stations)}")
+        except Exception as exc:  # noqa: BLE001
+            self.station_status.setText(f"Ошибка чтения БД: {exc}")
+            self.append_log(f"Ошибка чтения БД: {exc}")
+
+    def populate_station_table(self) -> None:
+        self.station_table.setUpdatesEnabled(False)
+        self.station_table.setRowCount(len(self.stations))
+        for row, station in enumerate(self.stations):
+            self.station_table.setItem(row, 0, QTableWidgetItem(station.stationid))
+            self.station_table.setItem(row, 1, QTableWidgetItem(station.name))
+            self.station_table.setItem(row, 2, QTableWidgetItem(station.src or ""))
+            updated = (
+                station.updated_at.strftime("%Y-%m-%d %H:%M")
+                if station.updated_at
+                else ""
+            )
+            self.station_table.setItem(row, 3, QTableWidgetItem(updated))
+            self.station_table.setItem(
+                row, 4, QTableWidgetItem(f"{station.lat:.2f}" if station.lat else "")
+            )
+            self.station_table.setItem(
+                row, 5, QTableWidgetItem(f"{station.lon:.2f}" if station.lon else "")
+            )
+        self.apply_station_filter()
+        self.station_table.setUpdatesEnabled(True)
+
+    def refresh_station_completers(self) -> None:
+        suggestions = [f"{s.stationid} — {s.name}" for s in self.stations]
+        completer = QCompleter(suggestions, self)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.activated.connect(self._on_station_completed)
+        self.station_input.setCompleter(completer)
+
+        if hasattr(self, "sounding_station_search"):
+            alt = QCompleter(suggestions, self)
+            alt.setCaseSensitivity(Qt.CaseInsensitive)
+            alt.setFilterMode(Qt.MatchContains)
+            alt.activated.connect(self._on_sounding_search_completed)
+            self.sounding_station_search.setCompleter(alt)
+
+    def _on_station_completed(self, text: str) -> None:
+        station_id = text.split("—")[0].strip()
+        self.station_input.setText(station_id)
+        station = self.resolve_station(station_id)
+        if station:
+            self.station_hint.setText(f"{station.stationid} — {station.name}")
+
+    def _on_sounding_search_completed(self, text: str) -> None:
+        station_id = text.split("—")[0].strip()
+        self.sounding_station_search.setText(station_id)
+
+    def resolve_station(self, query: str) -> Optional[StationInfo]:
+        cleaned = query.strip()
+        if not cleaned:
+            return None
+        with self.container.session() as session:
+            repo = self.container.station_repo(session)
+            exact = repo.get_by_id(cleaned)
+            if exact:
+                return exact
+            matches = repo.search(cleaned, limit=10)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            self.append_log(
+                f"Найдено {len(matches)} станций по запросу '{query}', использую {matches[0].stationid}"
+            )
+        return matches[0]
+
     def _cleanup_download_thread(self) -> None:
-        if self.download_thread is not None:
-            self.download_thread.wait(50)
         self.download_thread = None
         self.download_worker = None
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        self.download_selected_btn.setEnabled(True)
+
+    def load_soundings(self) -> None:
+        if self.sounding_worker is not None:
+            return
+        station_query = self.sounding_station_search.text().strip()
+        station_ids: Optional[list[str]] = None
+        if station_query:
+            with self.container.session() as session:
+                repo = self.container.station_repo(session)
+                matches = repo.search(station_query, limit=50)
+                station_ids = [m.stationid for m in matches]
+                if not station_ids:
+                    self.sounding_records = []
+                    self.populate_sounding_table()
+                    return
+        worker = SoundingLoadWorker(
+            session_factory=self.container.session,
+            station_ids=station_ids,
+            start=None,
+            end=None,
+            limit=500,
+        )
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.loaded.connect(self.on_soundings_loaded)
+        worker.failed.connect(self.on_soundings_failed)
+        worker.finished.connect(lambda: thread.quit())
+        worker.finished.connect(lambda: worker.deleteLater())
+        thread.finished.connect(thread.deleteLater)
+        self.sounding_worker = worker
+        self.sounding_thread = thread
+        thread.start()
+
+    def on_soundings_loaded(self, records: List[SoundingRecord]) -> None:
+        self.sounding_worker = None
+        self.sounding_thread = None
+        self.sounding_records = records
+        self.populate_sounding_table()
+
+    def on_soundings_failed(self, message: str) -> None:
+        self.sounding_worker = None
+        self.sounding_thread = None
+        self.sounding_records = []
+        self.populate_sounding_table()
+        self.append_log(f"Ошибка чтения профилей: {message}")
+
+    def populate_sounding_table(self) -> None:
+        self.sounding_table.setRowCount(len(self.sounding_records))
+        for row, record in enumerate(self.sounding_records):
+            self.sounding_table.setItem(
+                row, 0, QTableWidgetItem(str(record.record_id))
+            )
+            station_label = record.station_name or record.station_id
+            self.sounding_table.setItem(
+                row, 1, QTableWidgetItem(f"{record.station_id} — {station_label}")
+            )
+            self.sounding_table.setItem(
+                row,
+                2,
+                QTableWidgetItem(record.captured_at.strftime("%Y-%m-%d %H:%M")),
+            )
+            self.sounding_table.setItem(
+                row,
+                3,
+                QTableWidgetItem(record.downloaded_at.strftime("%Y-%m-%d %H:%M")),
+            )
+        if self.sounding_records:
+            self.sounding_table.selectRow(0)
+            self.display_payload(self.sounding_records[0])
+        else:
+            self.clear_payload_view()
+
+    def on_sounding_selection_changed(self) -> None:
+        selection = self.sounding_table.selectionModel().selectedRows()
+        if not selection:
+            self.clear_payload_view()
+            return
+        row = selection[0].row()
+        if 0 <= row < len(self.sounding_records):
+            self.display_payload(self.sounding_records[row])
+
+    def reset_sounding_filters(self) -> None:
+        self.sounding_station_search.clear()
+        self.load_soundings()
+
+    def display_payload(self, record: SoundingRecord) -> None:
+        payload = record.parsed_payload()
+        columns = payload.get("columns") or []
+        rows = payload.get("rows") or []
+        self.payload_table.setUpdatesEnabled(False)
+        self.payload_table.setColumnCount(len(columns))
+        self.payload_table.setRowCount(len(rows))
+        self.payload_table.setHorizontalHeaderLabels([str(c) for c in columns])
+        for r_idx, row in enumerate(rows):
+            for c_idx, col in enumerate(columns):
+                val = row.get(col, "")
+                item = QTableWidgetItem(str(val))
+                self.payload_table.setItem(r_idx, c_idx, item)
+        self.payload_table.resizeColumnsToContents()
+        self.payload_table.setUpdatesEnabled(True)
+
+    def clear_payload_view(self) -> None:
+        self.payload_table.clearContents()
+        self.payload_table.setRowCount(0)
+        self.payload_table.setColumnCount(0)
+
+    def _show_station_progress(self, message: str) -> None:
+        dlg = QProgressDialog(message, "Отменить", 0, 0, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.canceled.connect(self._cancel_station_update)
+        dlg.show()
+        self.station_progress = dlg
+
+    def _close_station_progress(self) -> None:
+        if self.station_progress:
+            self.station_progress.close()
+            self.station_progress = None
+
+    def _cancel_station_update(self) -> None:
+        if self.station_worker:
+            try:
+                self.station_worker.cancel()
+                self.append_log("Останавливаем актуализацию станций...")
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _asset_path(rel: str) -> Optional[str]:
@@ -519,8 +785,15 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     from PySide6.QtWidgets import QApplication
+    from ..di import get_container
 
+    container = get_container()
+    container.ensure_ready()
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(container)
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

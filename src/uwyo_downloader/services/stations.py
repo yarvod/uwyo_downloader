@@ -20,6 +20,7 @@ def fetch_stations_for_datetime(dt: datetime) -> List[StationInfo]:
         raise RuntimeError(f"HTTP {resp.status_code}")
     payload = resp.json()
     stations: List[StationInfo] = []
+    fetched_at = datetime.utcnow()
     for raw in payload.get("stations", []):
         stations.append(
             StationInfo(
@@ -28,6 +29,7 @@ def fetch_stations_for_datetime(dt: datetime) -> List[StationInfo]:
                 lat=raw.get("lat"),
                 lon=raw.get("lon"),
                 src=raw.get("src"),
+                updated_at=fetched_at,
             )
         )
     return stations

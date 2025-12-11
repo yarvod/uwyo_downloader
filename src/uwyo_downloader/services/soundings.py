@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -10,13 +11,21 @@ from ..config import BASE_URL, CONNECT_TIMEOUT, REQUEST_TIMEOUT, USER_AGENT
 from ..utils import make_filename
 
 
+class SoundingFetchResult:
+    def __init__(self, path: Path, content: str, station_name: str, payload_json: str) -> None:
+        self.path = path
+        self.content = content
+        self.station_name = station_name
+        self.payload_json = payload_json
+
+
 async def fetch_sounding(
     client: httpx.AsyncClient,
     station_id: str | int,
     dt: datetime,
     output_dir: Path,
     cancel_flag,
-) -> Optional[Path]:
+) -> Optional[SoundingFetchResult]:
     if cancel_flag.is_set():
         raise asyncio.CancelledError()
 
@@ -50,7 +59,8 @@ async def fetch_sounding(
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = make_filename(station_name, dt, output_dir)
     out_path.write_text(text_block, encoding="utf-8")
-    return out_path
+    payload_json = _parse_sounding_to_json(text_block)
+    return SoundingFetchResult(out_path, text_block, station_name, payload_json)
 
 
 def build_http_client(concurrency: int) -> httpx.AsyncClient:
@@ -64,3 +74,37 @@ def build_http_client(concurrency: int) -> httpx.AsyncClient:
         timeout=timeout,
         limits=limits,
     )
+
+
+def _parse_sounding_to_json(text_block: str) -> str:
+    """
+    Простая разметка текстового профиля в JSON: ищем строку заголовка столбцов и читаем
+    значения до первой пустой строки. Формат UWYO: множественные пробелы между значениями.
+    """
+    lines = text_block.splitlines()
+    columns: list[str] = []
+    rows: list[dict] = []
+    header_seen = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if header_seen:
+                break
+            continue
+        if not header_seen and stripped.startswith("PRES"):
+            columns = stripped.split()
+            header_seen = True
+            continue
+        if header_seen:
+            parts = stripped.split()
+            if len(parts) < len(columns):
+                continue
+            row: dict[str, object] = {}
+            for key, value in zip(columns, parts):
+                try:
+                    row[key] = float(value)
+                except ValueError:
+                    row[key] = value
+            rows.append(row)
+    payload = {"columns": columns, "rows": rows, "raw": text_block}
+    return json.dumps(payload, ensure_ascii=False)
