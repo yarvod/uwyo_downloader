@@ -841,6 +841,17 @@ class MainWindow(QMainWindow):
 
     def _payload_to_text(self, record: SoundingRecord) -> str:
         payload = record.parsed_payload()
+        columns = payload.get("columns") or []
+        rows = payload.get("rows") or []
+        if columns and rows:
+            lines = [";".join(str(col) for col in columns)]
+            for row in rows:
+                line = []
+                for col in columns:
+                    val = row.get(col, "")
+                    line.append("" if val is None else str(val))
+                lines.append(";".join(line))
+            return "\n".join(lines)
         raw = payload.get("raw")
         if isinstance(raw, str) and raw.strip():
             return raw

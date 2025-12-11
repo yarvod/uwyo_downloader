@@ -3,10 +3,15 @@ from pathlib import Path
 from typing import List
 
 
-def make_filename(station_name: str, dt: datetime, output_dir: Path) -> Path:
+def make_filename(
+    station_name: str,
+    dt: datetime,
+    output_dir: Path,
+    suffix: str = ".csv",
+) -> Path:
     safe_station = station_name.strip().split(",")[0].strip().lower()
     safe_station = safe_station.replace(" ", "_")
-    filename = f"{safe_station}_{dt:%Y_%m_%d_%H}.txt"
+    filename = f"{safe_station}_{dt:%Y_%m_%d_%H}{suffix}"
     return output_dir / filename
 
 
