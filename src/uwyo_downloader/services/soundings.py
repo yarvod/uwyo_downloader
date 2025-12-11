@@ -12,7 +12,7 @@ from ..utils import make_filename
 
 
 class SoundingFetchResult:
-    def __init__(self, path: Path, content: str, station_name: str, payload_json: str) -> None:
+    def __init__(self, path: Path | None, content: str, station_name: str, payload_json: str) -> None:
         self.path = path
         self.content = content
         self.station_name = station_name
@@ -25,6 +25,7 @@ async def fetch_sounding(
     dt: datetime,
     output_dir: Path,
     cancel_flag,
+    save_to_disk: bool = True,
 ) -> Optional[SoundingFetchResult]:
     if cancel_flag.is_set():
         raise asyncio.CancelledError()
@@ -56,9 +57,11 @@ async def fetch_sounding(
         raise RuntimeError("Нет блока <pre> с данными")
 
     text_block = pre.get_text("\n", strip=False)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = make_filename(station_name, dt, output_dir)
-    out_path.write_text(text_block, encoding="utf-8")
+    out_path: Path | None = None
+    if save_to_disk:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = make_filename(station_name, dt, output_dir)
+        out_path.write_text(text_block, encoding="utf-8")
     payload_json = _parse_sounding_to_json(text_block)
     return SoundingFetchResult(out_path, text_block, station_name, payload_json)
 

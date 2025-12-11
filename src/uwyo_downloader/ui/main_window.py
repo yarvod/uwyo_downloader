@@ -8,6 +8,7 @@ from typing import List, Optional
 from PySide6.QtCore import QDateTime, QThread, Qt
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
+    QCheckBox,
     QCompleter,
     QDateTimeEdit,
     QFileDialog,
@@ -176,6 +177,16 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(self.folder_input)
         folder_row.addWidget(folder_btn)
         layout.addLayout(folder_row)
+
+        save_row = QHBoxLayout()
+        self.save_to_folder_checkbox = QCheckBox("Сохранять файлы в папку")
+        self.save_to_folder_checkbox.setChecked(True)
+        self.save_to_folder_checkbox.stateChanged.connect(
+            lambda checked: self.folder_input.setEnabled(bool(checked))
+        )
+        save_row.addWidget(self.save_to_folder_checkbox)
+        save_row.addStretch()
+        layout.addLayout(save_row)
 
         buttons_row = QHBoxLayout()
         self.download_btn = QPushButton("Скачать")
@@ -420,7 +431,7 @@ class MainWindow(QMainWindow):
             datetimes,
             Path(self.folder_input.text()),
             station,
-            self.container.session,
+            save_to_disk=self.save_to_folder_checkbox.isChecked(),
         )
         thread = QThread()
         worker.moveToThread(thread)
@@ -428,6 +439,7 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_download_finished)
         worker.log.connect(self.append_log)
+        worker.persist_ready.connect(self.on_download_results)
         worker.finished.connect(lambda *_: thread.quit())
         worker.finished.connect(lambda *_: worker.deleteLater())
         thread.finished.connect(self._cleanup_download_thread)
@@ -455,7 +467,33 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.download_worker = None
         self.download_thread = None
-        self.load_soundings()
+
+    def on_download_results(self, payloads: list) -> None:
+        if not payloads:
+            return
+
+        def _write() -> int:
+            with self.container.session() as session:
+                station_repo = self.container.station_repo(session)
+                sounding_repo = self.container.sounding_repo(session)
+                saved = 0
+                for item in payloads:
+                    station_repo.ensure_station(item.station_id, item.station_name)
+                    sounding_repo.upsert_sounding(
+                        station_id=item.station_id,
+                        station_name=item.station_name,
+                        captured_at=item.captured_at,
+                        payload_json=item.payload_json,
+                    )
+                    saved += 1
+                return saved
+
+        try:
+            saved = DownloadWorker._retry_on_lock(_write, retries=5, delay=0.15)
+            self.append_log(f"В БД записано профилей: {saved}")
+            self.load_soundings()
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"Ошибка сохранения в БД: {exc}")
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")

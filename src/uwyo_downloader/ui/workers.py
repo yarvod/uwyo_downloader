@@ -9,16 +9,26 @@ from sqlalchemy.exc import OperationalError
 from PySide6.QtCore import QObject, Signal
 
 from ..config import DEFAULT_CONCURRENCY
-from ..db.repositories import SoundingRepository, StationRepository
+from ..db.repositories import StationRepository
 from ..models import SoundingRecord, StationInfo
 from ..services.soundings import SoundingFetchResult, build_http_client, fetch_sounding
 from ..services.stations import fetch_stations_for_datetime
+from dataclasses import dataclass
 
 
 class DownloadWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(bool, str)
     log = Signal(str)
+    persist_ready = Signal(list)
+
+    @dataclass
+    class DownloadedPayload:
+        station_id: str
+        captured_at: datetime
+        station_name: str
+        payload_json: str
+        path: Optional[Path]
 
     def __init__(
         self,
@@ -26,7 +36,7 @@ class DownloadWorker(QObject):
         datetimes: List[datetime],
         output_dir: Path,
         station: StationInfo,
-        session_factory: Callable,
+        save_to_disk: bool = True,
         concurrency: int = DEFAULT_CONCURRENCY,
     ) -> None:
         super().__init__()
@@ -35,8 +45,9 @@ class DownloadWorker(QObject):
         self.output_dir = output_dir
         self.concurrency = max(1, concurrency)
         self.station = station
-        self.session_factory = session_factory
+        self.save_to_disk = save_to_disk
         self._cancel_flag = threading.Event()
+        self._results: list[DownloadWorker.DownloadedPayload] = []
 
     def cancel(self) -> None:
         self._cancel_flag.set()
@@ -95,6 +106,7 @@ class DownloadWorker(QObject):
                             dt,
                             self.output_dir,
                             self._cancel_flag,
+                            save_to_disk=self.save_to_disk,
                         )
                         return dt, result, None
                     except asyncio.CancelledError:
@@ -112,29 +124,21 @@ class DownloadWorker(QObject):
                     done += 1
                     if isinstance(result, SoundingFetchResult):
                         station_name = result.station_name or self.station.name
-                        try:
-                            def _write():
-                                with self.session_factory() as session:
-                                    station_repo = StationRepository(session)
-                                    sounding_repo = SoundingRepository(session)
-                                    station_repo.ensure_station(
-                                        self.station_id, station_name
-                                    )
-                                    sounding_repo.upsert_sounding(
-                                        station_id=self.station_id,
-                                        station_name=station_name,
-                                        captured_at=dt,
-                                        payload_json=result.payload_json,
-                                    )
-
-                            self._retry_on_lock(_write)
-                            message = (
-                                f"{dt:%Y-%m-%d %H:%M} сохранено -> {result.path.name} (в БД)"
+                        self._results.append(
+                            DownloadWorker.DownloadedPayload(
+                                station_id=self.station_id,
+                                captured_at=dt,
+                                station_name=station_name,
+                                payload_json=result.payload_json,
+                                path=result.path,
                             )
-                            self.log.emit(message)
-                        except Exception as repo_exc:  # noqa: BLE001
-                            errors.append(f"{dt:%Y-%m-%d %H:%M} база: {repo_exc}")
-                            self.log.emit(errors[-1])
+                        )
+                        file_note = (
+                            f" -> {result.path.name}"
+                            if result.path
+                            else " (в памяти, без файла)"
+                        )
+                        self.log.emit(f"{dt:%Y-%m-%d %H:%M} скачано{file_note}")
                     elif exc:
                         msg = f"{dt:%Y-%m-%d %H:%M} ошибка: {exc}"
                         errors.append(msg)
@@ -149,6 +153,7 @@ class DownloadWorker(QObject):
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
 
+        self.persist_ready.emit(self._results)
         if self._cancel_flag.is_set():
             self.finished.emit(False, "Отменено")
         elif errors:
