@@ -37,6 +37,7 @@ from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
 from ..di import Container
 from ..models import SoundingRecord, StationInfo
 from ..utils import build_datetimes
+from .style import BASE_STYLESHEET
 from .workers import DownloadWorker, StationListWorker
 
 
@@ -169,6 +170,14 @@ class MainWindow(QMainWindow):
         step_row.addWidget(self.step_input)
         layout.addLayout(step_row)
 
+        save_row = QHBoxLayout()
+        self.save_to_folder_checkbox = QCheckBox("Сохранять файлы в папку")
+        self.save_to_folder_checkbox.setChecked(True)
+        self.save_to_folder_checkbox.stateChanged.connect(self._toggle_folder_inputs)
+        save_row.addWidget(self.save_to_folder_checkbox)
+        save_row.addStretch()
+        layout.addLayout(save_row)
+
         folder_row = QHBoxLayout()
         self.folder_input = QLineEdit(str(self.output_dir))
         self.folder_input.setPlaceholderText("Папка для сохранения")
@@ -176,17 +185,10 @@ class MainWindow(QMainWindow):
         folder_btn.clicked.connect(self.choose_folder)
         folder_row.addWidget(self.folder_input)
         folder_row.addWidget(folder_btn)
-        layout.addLayout(folder_row)
-
-        save_row = QHBoxLayout()
-        self.save_to_folder_checkbox = QCheckBox("Сохранять файлы в папку")
-        self.save_to_folder_checkbox.setChecked(True)
-        self.save_to_folder_checkbox.stateChanged.connect(
-            lambda checked: self.folder_input.setEnabled(bool(checked))
-        )
-        save_row.addWidget(self.save_to_folder_checkbox)
-        save_row.addStretch()
-        layout.addLayout(save_row)
+        self.folder_row_widget = QWidget()
+        self.folder_row_widget.setLayout(folder_row)
+        layout.addWidget(self.folder_row_widget)
+        self._toggle_folder_inputs(self.save_to_folder_checkbox.isChecked())
 
         buttons_row = QHBoxLayout()
         self.download_btn = QPushButton("Скачать")
@@ -362,24 +364,7 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.Highlight, QColor("#22d3ee"))
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#0b1220"))
         self.setPalette(palette)
-        self.setStyleSheet(
-            """
-            QGroupBox { border: 1px solid #1f2937; border-radius: 8px; margin-top: 12px; padding: 12px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #9ca3af; }
-            QLabel { color: #e5e7eb; }
-            QLineEdit, QDateTimeEdit, QPlainTextEdit, QSpinBox, QTableWidget, QComboBox {
-                background: #0f172a; border: 1px solid #1f2937; color: #e5e7eb; border-radius: 6px; padding: 6px;
-            }
-            QPushButton {
-                background: #22d3ee; color: #0b1220; border: none; border-radius: 6px; padding: 8px 12px;
-                font-weight: 600;
-            }
-            QPushButton:disabled { background: #1f2937; color: #9ca3af; }
-            QProgressBar { background: #0f172a; border: 1px solid #1f2937; border-radius: 6px; text-align: center; }
-            QProgressBar::chunk { background: #22d3ee; border-radius: 6px; }
-            QTableWidget { gridline-color: #1f2937; }
-            """
-        )
+        self.setStyleSheet(BASE_STYLESHEET)
 
     def choose_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -501,6 +486,12 @@ class MainWindow(QMainWindow):
         print(line, flush=True)
         self.log.appendPlainText(line)
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def _toggle_folder_inputs(self, checked: bool | int) -> None:
+        visible = bool(checked)
+        self.folder_input.setEnabled(visible)
+        if hasattr(self, "folder_row_widget"):
+            self.folder_row_widget.setVisible(visible)
 
     def load_stations(self) -> None:
         if self.station_worker is not None:
