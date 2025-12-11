@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
+from pyqtgraph import PlotWidget, mkPen
+from pyqtgraph.graphicsItems.DateAxisItem import DateAxisItem
 from PySide6.QtCore import QDateTime, Qt
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
@@ -12,6 +15,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QCompleter,
     QDateTimeEdit,
+    QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -62,6 +67,8 @@ class MainWindow(QMainWindow):
         self.current_page = 1
         self.total_records = 0
         self.total_pages = 1
+        self._pwv_dialog: Optional["PWVDialog"] = None
+        self.destroyed.connect(self._close_children_windows)
 
         self.build_ui()
         self.apply_palette()
@@ -338,6 +345,7 @@ class MainWindow(QMainWindow):
             ["ID", "Станция", "Дата", "Загружено"]
         )
         self.sounding_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sounding_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.sounding_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.sounding_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.sounding_table.customContextMenuRequested.connect(
@@ -859,15 +867,28 @@ class MainWindow(QMainWindow):
 
     def _on_sounding_context_menu(self, pos) -> None:
         row = self.sounding_table.rowAt(pos.y())
-        if row < 0 or row >= len(self.sounding_records):
+        if row < 0:
             return
-        self.sounding_table.selectRow(row)
-        record = self.sounding_records[row]
+        # ensure right-clicked row is part of selection
+        selection = self.sounding_table.selectionModel().selectedRows()
+        if not selection or all(idx.row() != row for idx in selection):
+            self.sounding_table.selectRow(row)
+            selection = self.sounding_table.selectionModel().selectedRows()
+        selected_records = []
+        for idx in selection:
+            if 0 <= idx.row() < len(self.sounding_records):
+                selected_records.append(self.sounding_records[idx.row()])
+        if not selected_records:
+            return
+
         menu = QMenu(self)
         save_action = menu.addAction("Сохранить профиль в папку...")
+        pwv_action = menu.addAction("Построить PWV")
         chosen = menu.exec(self.sounding_table.mapToGlobal(pos))
-        if chosen == save_action:
-            self._save_sounding_record(record)
+        if chosen == save_action and len(selected_records) == 1:
+            self._save_sounding_record(selected_records[0])
+        elif chosen == pwv_action:
+            self._show_pwv_dialog(selected_records)
 
     def _save_sounding_record(self, record: SoundingRecord) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -890,6 +911,54 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"Не удалось сохранить профиль: {exc}")
             QMessageBox.warning(self, "Ошибка сохранения", str(exc))
+
+    def _show_pwv_dialog(self, records: list[SoundingRecord]) -> None:
+        if not records:
+            return
+        if self._pwv_dialog:
+            try:
+                self._pwv_dialog.close()
+            except Exception:
+                pass
+        dialog = PWVDialog(self, records, self._compute_pwv_for_record)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.finished.connect(lambda _: setattr(self, "_pwv_dialog", None))
+        self._pwv_dialog = dialog
+        dialog.show()
+
+    def _compute_pwv_for_record(self, record: SoundingRecord, min_height: float) -> Optional[float]:
+        payload = record.parsed_payload()
+        columns = payload.get("columns") or []
+        rows = payload.get("rows") or []
+        if not columns or not rows:
+            return None
+        col_map = {
+            (str(col).split(",", 1)[0].strip()): str(col)
+            for col in columns
+        }
+        h_col = col_map.get("HGHT")
+        absh_col = col_map.get("ABSH")
+        if not h_col or not absh_col:
+            return None
+        samples: list[tuple[float, float]] = []
+        for row in rows:
+            try:
+                h_val = float(row.get(h_col))
+                a_val = float(row.get(absh_col))
+            except (TypeError, ValueError):
+                continue
+            if h_val < min_height:
+                continue
+            samples.append((h_val, a_val))
+        if len(samples) < 2:
+            return None
+        samples.sort(key=lambda x: x[0])
+        heights = np.array([s[0] for s in samples], dtype=float)
+        absh = np.array([s[1] for s in samples], dtype=float)
+        try:
+            return float(np.trapezoid(absh, heights) / 1000.0)
+        except Exception:
+            return None
 
     def clear_payload_view(self) -> None:
         self.payload_table.clearContents()
@@ -936,6 +1005,137 @@ class MainWindow(QMainWindow):
             if candidate.exists():
                 return str(candidate)
         return None
+
+    def closeEvent(self, event):  # type: ignore[override]
+        for window in QApplication.topLevelWidgets():
+            try:
+                if window is not self:
+                    window.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
+
+    def _close_children_windows(self) -> None:
+        for window in QApplication.topLevelWidgets():
+            try:
+                window.close()
+            except Exception:
+                pass
+
+class PWVDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        records: list[SoundingRecord],
+        compute_func,
+        default_min_height: float = 0.0,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("PWV по профилям")
+        self.resize(900, 600)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #0b1220;
+                color: #e5e7eb;
+            }
+            QDoubleSpinBox {
+                background-color: #111827;
+                color: #e5e7eb;
+                border: 1px solid #1f2937;
+                padding: 4px 6px;
+                border-radius: 4px;
+            }
+            QDoubleSpinBox:focus {
+                border: 1px solid #22d3ee;
+            }
+            QLabel {
+                color: #e5e7eb;
+            }
+            """
+        )
+        self.records_by_station: dict[str, list[SoundingRecord]] = {}
+        for rec in records:
+            self.records_by_station.setdefault(rec.station_id, []).append(rec)
+        self.compute_func = compute_func
+
+        axis = DateAxisItem()
+        self.plot = PlotWidget(axisItems={"bottom": axis})
+        # тёмная подложка вокруг, светлое поле графика
+        self.plot.setBackground("#0b1220")  # вокруг canvas
+        self.plot.getPlotItem().getViewBox().setBackgroundColor("#f5f5f5")  # само поле
+        self.plot.showGrid(x=True, y=True, alpha=0.4)
+        self.plot.setLabel("bottom", "Дата")
+        self.plot.setLabel("left", "PWV", units="мм")
+        self.legend = self.plot.addLegend()
+
+        self.min_height_input = QDoubleSpinBox(self)
+        self.min_height_input.setRange(0, 100_000)
+        self.min_height_input.setValue(default_min_height)
+        self.min_height_input.setSuffix(" м")
+        self.min_height_input.setSingleStep(10)
+        self.min_height_input.valueChanged.connect(self._replot)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Высота от:"))
+        top_row.addWidget(self.min_height_input)
+        top_row.addStretch()
+
+        self.status_label = QLabel("")
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(top_row)
+        layout.addWidget(self.plot)
+        layout.addWidget(self.status_label)
+
+        self._replot()
+
+    def _replot(self) -> None:
+        min_h = float(self.min_height_input.value())
+        self.plot.clear()
+        if self.legend:
+            self.plot.removeItem(self.legend)
+        self.legend = self.plot.addLegend()
+
+        palette = [
+            "#2563EB",  # синий
+            "#DC2626",  # красный
+            "#059669",  # зелёный
+            "#EA580C",  # оранжевый
+            "#9333EA",  # фиолетовый
+            "#0EA5E9",  # голубой
+            "#BE123C",  # малиновый
+            "#65A30D",  # олива
+        ]
+        any_series = False
+        status_parts = []
+        for idx, (station_id, items) in enumerate(self.records_by_station.items()):
+            points: list[tuple[float, float]] = []
+            for rec in sorted(items, key=lambda r: r.captured_at):
+                pwv = self.compute_func(rec, min_h)
+                if pwv is None:
+                    continue
+                ts = rec.captured_at.timestamp()
+                points.append((ts, pwv))
+            if not points:
+                continue
+            points.sort(key=lambda p: p[0])
+            xs, ys = zip(*points)
+            color = palette[idx % len(palette)]
+            pen = mkPen(color=color, width=2)
+            curve = self.plot.plot(xs, ys, pen=pen, symbol="o", symbolSize=6, symbolBrush=color)
+            label = station_id
+            name = items[0].station_name or ""
+            if name:
+                label = f"{station_id} — {name}"
+            self.legend.addItem(curve, label)
+            any_series = True
+            status_parts.append(f"{label}: {len(points)} точек")
+
+        if not any_series:
+            self.status_label.setText("Нет данных для расчёта PWV (нужны HGHT и ABSH минимум из двух точек).")
+        else:
+            self.status_label.setText("; ".join(status_parts))
 
 
 def main() -> None:
