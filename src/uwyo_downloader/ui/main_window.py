@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenuBar,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QProgressBar,
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
 from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
 from ..di import Container
 from ..models import SoundingRecord, StationInfo
-from ..utils import build_datetimes
+from ..utils import build_datetimes, make_filename
 from .style import BASE_STYLESHEET
 from .state import drain_soundings, drain_stations
 from .workers import DownloadThread, StationThread, retry_on_lock
@@ -128,6 +129,24 @@ class MainWindow(QMainWindow):
         """
         hour_slot = 12 if dt.hour >= 12 else 0
         return dt.replace(hour=hour_slot, minute=0, second=0, microsecond=0)
+
+    @staticmethod
+    def _extract_station_id(raw: str) -> str:
+        """
+        Достаёт ID станции из строки вида "12345 — Name" или "ABCD Name".
+        """
+        cleaned = raw.strip()
+        if not cleaned:
+            return ""
+        for sep in ("—", "–", "-"):
+            if sep in cleaned:
+                cleaned = cleaned.split(sep, 1)[0].strip()
+                break
+        if " " in cleaned:
+            first = cleaned.split()[0].strip()
+            if first.isdigit() or first.isupper():
+                return first
+        return cleaned
 
     @classmethod
     def _current_synoptic_qdatetime(cls) -> QDateTime:
@@ -320,6 +339,10 @@ class MainWindow(QMainWindow):
         )
         self.sounding_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.sounding_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.sounding_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.sounding_table.customContextMenuRequested.connect(
+            self._on_sounding_context_menu
+        )
         header: QHeaderView = self.sounding_table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setMinimumSectionSize(50)
@@ -398,7 +421,9 @@ class MainWindow(QMainWindow):
     def start_download(self) -> None:
         if self.download_thread is not None:
             return
-        query = self.station_input.text().strip()
+        query_raw = self.station_input.text().strip()
+        station_id = self._extract_station_id(query_raw)
+        query = station_id or query_raw
         if not query:
             self.append_log("Укажите ID станции.")
             return
@@ -424,10 +449,12 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(True)
         self._download_handled = False
 
+        target_dir = Path(self.folder_input.text()).expanduser()
+        self.output_dir = target_dir
         thread = DownloadThread(
             station.stationid,
             datetimes,
-            Path(self.folder_input.text()),
+            target_dir,
             station,
             save_to_disk=self.save_to_folder_checkbox.isChecked(),
         )
@@ -654,26 +681,29 @@ class MainWindow(QMainWindow):
             self.sounding_station_search.setCompleter(alt)
 
     def _on_station_completed(self, text: str) -> None:
-        station_id = text.split("—")[0].strip()
+        station_id = self._extract_station_id(text)
         self.station_input.setText(station_id)
         station = self.resolve_station(station_id)
         if station:
             self.station_hint.setText(f"{station.stationid} — {station.name}")
 
     def _on_sounding_search_completed(self, text: str) -> None:
-        station_id = text.split("—")[0].strip()
+        station_id = self._extract_station_id(text)
         self.sounding_station_search.setText(station_id)
 
     def resolve_station(self, query: str) -> Optional[StationInfo]:
         cleaned = query.strip()
-        if not cleaned:
+        station_id = self._extract_station_id(cleaned)
+        search_term = station_id or cleaned
+        if not search_term:
             return None
         with self.container.session() as session:
             repo = self.container.station_repo(session)
-            exact = repo.get_by_id(cleaned)
-            if exact:
-                return exact
-            matches = repo.search(cleaned, limit=10)
+            if station_id:
+                exact = repo.get_by_id(station_id)
+                if exact:
+                    return exact
+            matches = repo.search(search_term, limit=10)
         if not matches:
             return None
         if len(matches) > 1:
@@ -695,7 +725,7 @@ class MainWindow(QMainWindow):
                 with self.container.session() as session:
                     station_ids: Optional[list[str]] = None
                     if station_query:
-                        parsed_id = station_query.split("—")[0].strip()
+                        parsed_id = self._extract_station_id(station_query)
                         station_repo = self.container.station_repo(session)
                         if parsed_id and not station_repo.get_by_id(parsed_id):
                             self.current_page = 1
@@ -808,6 +838,47 @@ class MainWindow(QMainWindow):
                 self.payload_table.setItem(r_idx, c_idx, item)
         self.payload_table.resizeColumnsToContents()
         self.payload_table.setUpdatesEnabled(True)
+
+    def _payload_to_text(self, record: SoundingRecord) -> str:
+        payload = record.parsed_payload()
+        raw = payload.get("raw")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        return record.payload_json
+
+    def _on_sounding_context_menu(self, pos) -> None:
+        row = self.sounding_table.rowAt(pos.y())
+        if row < 0 or row >= len(self.sounding_records):
+            return
+        self.sounding_table.selectRow(row)
+        record = self.sounding_records[row]
+        menu = QMenu(self)
+        save_action = menu.addAction("Сохранить профиль в папку...")
+        chosen = menu.exec(self.sounding_table.mapToGlobal(pos))
+        if chosen == save_action:
+            self._save_sounding_record(record)
+
+    def _save_sounding_record(self, record: SoundingRecord) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку для сохранения",
+            str(self.output_dir),
+        )
+        if not folder:
+            return
+        target_dir = Path(folder).expanduser()
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            file_path = make_filename(
+                record.station_name or record.station_id,
+                record.captured_at,
+                target_dir,
+            )
+            file_path.write_text(self._payload_to_text(record), encoding="utf-8")
+            self.append_log(f"Профиль сохранён: {file_path}")
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"Не удалось сохранить профиль: {exc}")
+            QMessageBox.warning(self, "Ошибка сохранения", str(exc))
 
     def clear_payload_view(self) -> None:
         self.payload_table.clearContents()
