@@ -21,6 +21,7 @@ echo "Using version: $APP_VERSION"
 
 DIST_DIR="$ROOT_DIR/dist"
 APP_NAME="profile-downloader-${APP_VERSION}"
+TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
 
 # Clean previous artifacts for this version to avoid mv/zip conflicts.
 rm -rf "${DIST_DIR:?}/${APP_NAME}" "${DIST_DIR:?}/${APP_NAME}.app" "${DIST_DIR:?}/${APP_NAME}-macos" "${DIST_DIR:?}/${APP_NAME}-macos.app"
@@ -40,6 +41,7 @@ pyinstaller --noconfirm --windowed \
   --name "profile-downloader-${APP_VERSION}" \
   --paths src \
   --icon assets/icons/app.icns \
+  --target-arch "${TARGET_ARCH}" \
   --hidden-import logging.config \
   --add-data "assets/icons/icon-256.png:assets/icons" \
   --add-data "src/uwyo_downloader/db/alembic:uwyo_downloader/db/alembic" \
@@ -60,5 +62,10 @@ else
 fi
 
 mv "$SRC_PATH" "$DIST_DIR/$FINAL_NAME"
+
+(
+  cd "$DIST_DIR"
+  ditto -ck --rsrc --sequesterRsrc --keepParent "$FINAL_NAME" "../${APP_NAME}-macos.zip"
+)
 
 echo "Artifact: ${APP_NAME}-macos.zip"

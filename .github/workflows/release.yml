@@ -57,13 +57,14 @@ jobs:
           )
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             ICON_ARG="--icon assets/icons/app.icns"
+            ARCH_ARG="--target-arch arm64"
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
             ADD_DATA=(
               "assets/icons/icon-256.png;assets/icons"
               "src/uwyo_downloader/db/alembic;uwyo_downloader/db/alembic"
             )
           fi
-          pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src $ICON_ARG --hidden-import logging.config "${ADD_DATA[@]/#/--add-data=}" main.py
+          pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src $ICON_ARG ${ARCH_ARG:-} --hidden-import logging.config "${ADD_DATA[@]/#/--add-data=}" main.py
 
       - name: Archive (macOS)
         if: runner.os == 'macOS'
@@ -84,11 +85,12 @@ jobs:
             exit 1
           fi
           mv "$SRC" "${DIST_DIR}/${FINAL}"
-          (cd "$DIST_DIR" && zip -r "../${APP_NAME}-macos.zip" "$FINAL")
+          (cd "$DIST_DIR" && ditto -ck --rsrc --sequesterRsrc --keepParent "$FINAL" "../${APP_NAME}-macos.zip")
 
       - name: Archive (Windows)
         if: runner.os == 'Windows'
-        run: powershell -Command "Move-Item dist\\\"profile-downloader-${Env:APP_VERSION}\" dist\\\"profile-downloader-${Env:APP_VERSION}-windows\"; Compress-Archive -Path dist\\\"profile-downloader-${Env:APP_VERSION}-windows\" -DestinationPath \"profile-downloader-${Env:APP_VERSION}-windows.zip\""
+        run: |
+          powershell -Command "Move-Item \"dist\\profile-downloader-${Env:APP_VERSION}\" \"dist\\profile-downloader-${Env:APP_VERSION}-windows\"; Compress-Archive -Path \"dist\\profile-downloader-${Env:APP_VERSION}-windows\" -DestinationPath \"profile-downloader-${Env:APP_VERSION}-windows.zip\""
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
