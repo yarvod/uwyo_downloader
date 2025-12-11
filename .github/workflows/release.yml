@@ -55,6 +55,7 @@ jobs:
             "assets/icons/icon-256.png:assets/icons"
             "src/uwyo_downloader/db/alembic:uwyo_downloader/db/alembic"
           )
+          SAFE_VERSION="${APP_VERSION//./-}"
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             ICON_ARG="--icon assets/icons/app.icns"
             ARCH_ARG="--target-arch arm64"
@@ -64,13 +65,13 @@ jobs:
               "src/uwyo_downloader/db/alembic;uwyo_downloader/db/alembic"
             )
           fi
-          pyinstaller --noconfirm --windowed --name "profile-downloader-${APP_VERSION}" --paths src $ICON_ARG ${ARCH_ARG:-} --hidden-import logging.config "${ADD_DATA[@]/#/--add-data=}" main.py
+          pyinstaller --noconfirm --windowed --name "profile-downloader-${SAFE_VERSION}" --paths src $ICON_ARG ${ARCH_ARG:-} --hidden-import logging.config "${ADD_DATA[@]/#/--add-data=}" main.py
 
       - name: Archive (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          APP_NAME="profile-downloader-${APP_VERSION}"
+          APP_NAME="profile-downloader-${APP_VERSION//./-}"
           DIST_DIR="dist"
           APP_DIR="${DIST_DIR}/${APP_NAME}"
           APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"
@@ -90,15 +91,12 @@ jobs:
       - name: Archive (Windows)
         if: runner.os == 'Windows'
         run: |
-          pwsh -Command "
-            $orig = \"profile-downloader-${Env:APP_VERSION}\";
-            $safeVer = \"${Env:APP_VERSION}\" -replace '\\.', '-';
-            $archive = \"profile-downloader-$safeVer-windows.zip\";
-            $src = Join-Path dist $orig;
-            $dst = Join-Path dist ($orig + '-windows');
-            Move-Item $src $dst;
-            Compress-Archive -Path $dst -DestinationPath $archive;
-          "
+          $safeVer = "${Env:APP_VERSION}" -replace '\.', '-'
+          $orig = "profile-downloader-$safeVer"
+          $src = "dist/$orig"
+          $dst = "dist/${orig}-windows"
+          Move-Item -Path $src -Destination $dst
+          Compress-Archive -Path $dst -DestinationPath "profile-downloader-$safeVer-windows.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

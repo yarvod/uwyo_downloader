@@ -20,7 +20,8 @@ export APP_VERSION
 echo "Using version: $APP_VERSION"
 
 DIST_DIR="$ROOT_DIR/dist"
-APP_NAME="profile-downloader-${APP_VERSION}"
+SAFE_VERSION="${APP_VERSION//./-}"
+APP_NAME="profile-downloader-${SAFE_VERSION}"
 TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
 
 # Clean previous artifacts for this version to avoid mv/zip conflicts.
