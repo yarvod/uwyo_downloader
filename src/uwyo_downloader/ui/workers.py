@@ -1,9 +1,11 @@
 import asyncio
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from sqlalchemy.exc import OperationalError
 from PySide6.QtCore import QObject, Signal
 
 from ..config import DEFAULT_CONCURRENCY
@@ -38,6 +40,24 @@ class DownloadWorker(QObject):
 
     def cancel(self) -> None:
         self._cancel_flag.set()
+
+    @staticmethod
+    def _retry_on_lock(func: Callable, retries: int = 3, delay: float = 0.2):
+        """
+        Run DB action with small retry window to avoid UI hiccups on sqlite locks.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return func()
+            except OperationalError as exc:
+                msg = str(exc).lower()
+                if "database is locked" not in msg and "busy" not in msg:
+                    raise
+                last_exc = exc
+                time.sleep(delay * (attempt + 1))
+        if last_exc:
+            raise last_exc
 
     def run(self) -> None:
         loop = asyncio.new_event_loop()
@@ -93,18 +113,21 @@ class DownloadWorker(QObject):
                     if isinstance(result, SoundingFetchResult):
                         station_name = result.station_name or self.station.name
                         try:
-                            with self.session_factory() as session:
-                                station_repo = StationRepository(session)
-                                sounding_repo = SoundingRepository(session)
-                                station_repo.ensure_station(
-                                    self.station_id, station_name
-                                )
-                                sounding_repo.upsert_sounding(
-                                    station_id=self.station_id,
-                                    station_name=station_name,
-                                    captured_at=dt,
-                                    payload_json=result.payload_json,
-                                )
+                            def _write():
+                                with self.session_factory() as session:
+                                    station_repo = StationRepository(session)
+                                    sounding_repo = SoundingRepository(session)
+                                    station_repo.ensure_station(
+                                        self.station_id, station_name
+                                    )
+                                    sounding_repo.upsert_sounding(
+                                        station_id=self.station_id,
+                                        station_name=station_name,
+                                        captured_at=dt,
+                                        payload_json=result.payload_json,
+                                    )
+
+                            self._retry_on_lock(_write)
                             message = (
                                 f"{dt:%Y-%m-%d %H:%M} сохранено -> {result.path.name} (в БД)"
                             )
@@ -189,28 +212,34 @@ class SoundingLoadWorker(QObject):
     def __init__(
         self,
         session_factory: Callable,
-        station_ids: list[str] | None,
-        start: datetime | None,
-        end: datetime | None,
+        station_query: str | None,
         limit: int = 500,
     ) -> None:
         super().__init__()
         self.session_factory = session_factory
-        self.station_ids = station_ids
-        self.start = start
-        self.end = end
+        self.station_query = station_query
         self.limit = limit
 
     def run(self) -> None:
         try:
-            with self.session_factory() as session:
-                repo = SoundingRepository(session)
-                records: List[SoundingRecord] = repo.list(
-                    station_ids=self.station_ids,
-                    start=self.start,
-                    end=self.end,
-                    limit=self.limit,
-                )
+            def _read() -> List[SoundingRecord]:
+                with self.session_factory() as session:
+                    station_ids: list[str] | None = None
+                    if self.station_query:
+                        station_repo = StationRepository(session)
+                        matches = station_repo.search(self.station_query, limit=50)
+                        station_ids = [m.stationid for m in matches]
+                        if not station_ids:
+                            return []
+                    repo = SoundingRepository(session)
+                    return repo.list(
+                        station_ids=station_ids,
+                        start=None,
+                        end=None,
+                        limit=self.limit,
+                    )
+
+            records = DownloadWorker._retry_on_lock(_read, retries=5, delay=0.15)
             self.loaded.emit(records)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))

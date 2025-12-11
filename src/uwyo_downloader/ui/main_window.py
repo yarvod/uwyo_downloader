@@ -36,7 +36,7 @@ from ..config import APP_VERSION, DEFAULT_OUTPUT_DIR
 from ..di import Container
 from ..models import SoundingRecord, StationInfo
 from ..utils import build_datetimes
-from .workers import DownloadWorker, SoundingLoadWorker, StationListWorker
+from .workers import DownloadWorker, StationListWorker
 
 
 class MainWindow(QMainWindow):
@@ -50,8 +50,7 @@ class MainWindow(QMainWindow):
         self.station_thread: Optional[QThread] = None
         self.station_worker: Optional[StationListWorker] = None
         self.station_progress: Optional[QProgressDialog] = None
-        self.sounding_thread: Optional[QThread] = None
-        self.sounding_worker = None
+        self.sounding_loading = False
         self.stations: List[StationInfo] = []
         self.sounding_records: List[SoundingRecord] = []
         self.icon_path = self._asset_path("assets/icons/icon-256.png")
@@ -636,50 +635,38 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
 
     def load_soundings(self) -> None:
-        if self.sounding_worker is not None:
+        if self.sounding_loading:
             return
-        station_query = self.sounding_station_search.text().strip()
-        station_ids: Optional[list[str]] = None
-        if station_query:
-            with self.container.session() as session:
-                repo = self.container.station_repo(session)
-                matches = repo.search(station_query, limit=50)
-                station_ids = [m.stationid for m in matches]
-                if not station_ids:
-                    self.sounding_records = []
-                    self.populate_sounding_table()
-                    return
-        worker = SoundingLoadWorker(
-            session_factory=self.container.session,
-            station_ids=station_ids,
-            start=None,
-            end=None,
-            limit=500,
-        )
-        thread = QThread()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.loaded.connect(self.on_soundings_loaded)
-        worker.failed.connect(self.on_soundings_failed)
-        worker.finished.connect(lambda: thread.quit())
-        worker.finished.connect(lambda: worker.deleteLater())
-        thread.finished.connect(thread.deleteLater)
-        self.sounding_worker = worker
-        self.sounding_thread = thread
-        thread.start()
+        self.sounding_loading = True
+        try:
+            station_query = self.sounding_station_search.text().strip() or None
 
-    def on_soundings_loaded(self, records: List[SoundingRecord]) -> None:
-        self.sounding_worker = None
-        self.sounding_thread = None
-        self.sounding_records = records
-        self.populate_sounding_table()
+            def _read_soundings() -> List[SoundingRecord]:
+                with self.container.session() as session:
+                    station_ids: Optional[list[str]] = None
+                    if station_query:
+                        station_repo = self.container.station_repo(session)
+                        matches = station_repo.search(station_query, limit=50)
+                        station_ids = [m.stationid for m in matches] or None
+                        if station_ids is None:
+                            return []
+                    repo = self.container.sounding_repo(session)
+                    return repo.list(
+                        station_ids=station_ids,
+                        start=None,
+                        end=None,
+                        limit=500,
+                    )
 
-    def on_soundings_failed(self, message: str) -> None:
-        self.sounding_worker = None
-        self.sounding_thread = None
-        self.sounding_records = []
-        self.populate_sounding_table()
-        self.append_log(f"Ошибка чтения профилей: {message}")
+            records = DownloadWorker._retry_on_lock(_read_soundings, retries=5, delay=0.1)
+            self.sounding_records = records
+            self.populate_sounding_table()
+        except Exception as exc:  # noqa: BLE001
+            self.sounding_records = []
+            self.populate_sounding_table()
+            self.append_log(f"Ошибка чтения профилей: {exc}")
+        finally:
+            self.sounding_loading = False
 
     def populate_sounding_table(self) -> None:
         self.sounding_table.setRowCount(len(self.sounding_records))

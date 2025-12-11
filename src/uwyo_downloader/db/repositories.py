@@ -110,7 +110,7 @@ class SoundingRepository:
             payload_json=payload_json,
         )
         stmt = stmt.on_conflict_do_update(
-            constraint="uq_sounding_station_time",
+            index_elements=[Sounding.station_id, Sounding.captured_at],
             set_={
                 "payload_json": stmt.excluded.payload_json,
                 "station_name": stmt.excluded.station_name,
